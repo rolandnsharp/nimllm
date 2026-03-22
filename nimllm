@@ -41,6 +41,10 @@ case "${1:-help}" in
   feed)
     exec "$DIR/feed_books.sh"
     ;;
+  data)
+    echo "rebuilding training_data.txt from all sources..."
+    python3 "$DIR/build_data.py"
+    ;;
   build)
     echo "compiling CUDA kernels..."
     cd "$SRC" && nvcc -c -O2 -Xcompiler -fPIC -o kernels.o kernels.cu
@@ -88,6 +92,7 @@ case "${1:-help}" in
     echo "  read <file>        absorb a text file into weights"
     echo "  grow <checkpoint>  expand model from smaller checkpoint"
     echo "  feed               feed all books in ~/data/books/"
+    echo "  data               rebuild training_data.txt from all sources"
     echo "  build              compile CUDA kernels + Nim binaries"
     echo "  status             show model info"
     echo ""
