@@ -1,0 +1,17 @@
+# Compiled
+src/microgpt
+src/chat
+src/kernels.o
+*.o
+
+# Model checkpoints and tokenizer (too large for git)
+*.bin
+
+# Editor
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Nim cache
+nimcache/
