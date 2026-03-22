@@ -22,6 +22,10 @@ case "${1:-help}" in
   chat)
     exec "$SRC/chat"
     ;;
+  prompt)
+    shift
+    exec "$SRC/chat" --prompt "$@"
+    ;;
   read)
     if [ -z "$2" ]; then
       echo "usage: nimllm read <textfile>"

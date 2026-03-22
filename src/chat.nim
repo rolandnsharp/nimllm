@@ -230,6 +230,33 @@ proc sample(logits: seq[float32], temperature: float32 = 0.8f,
 
 # ── Main ──────────────────────────────────────────────────────────
 
+proc generate(m: Model, tok: Tokenizer, prompt: string,
+              history: var seq[int32], maxTokens: int = 200): string =
+  ## Generate a response to a prompt. Returns the generated text.
+  let inputTokens = tok.encode("<|user|> " & prompt & " <|assistant|> ")
+  for id in inputTokens:
+    history.add(int32(id))
+
+  var response = ""
+  for _ in 0 ..< maxTokens:
+    var context = history
+    if context.len > blockSize:
+      context = context[context.len - blockSize ..< context.len]
+
+    let logits = forwardOneToken(m, context, context.len)
+    freeStepAllocations()
+    let tokenId = sample(logits)
+
+    if tokenId == tok.bosId or tokenId == tok.userId or
+       tokenId == tok.assistantId:
+      break
+
+    history.add(int32(tokenId))
+    let tokenStr = tok.vocab[tokenId]
+    response.add(tokenStr)
+
+  response
+
 when isMainModule:
   let baseDir = getAppDir().parentDir()
   let vidyaRoot = baseDir.parentDir()
@@ -238,13 +265,11 @@ when isMainModule:
 
   gpuInit()
 
-  # Load tokenizer
   if not fileExists(tokenizerFile):
     echo "no tokenizer found at ", tokenizerFile
     quit(1)
   let tok = loadTokenizer(tokenizerFile)
 
-  # Load model
   var m = initModel(tok.vocab.len)
   if fileExists(modelFile):
     loadModel(m, modelFile)
@@ -256,16 +281,25 @@ when isMainModule:
   randomize()
   trackingEnabled = true
 
+  # Non-interactive mode: --prompt "question" prints answer and exits
+  if paramCount() >= 2 and paramStr(1) == "--prompt":
+    var prompt = paramStr(2)
+    for i in 3 .. paramCount(): prompt &= " " & paramStr(i)
+    var history: seq[int32]
+    echo generate(m, tok, prompt, history)
+    quit(0)
+
+  # Interactive mode
   echo ""
-  let paramCount = tok.vocab.len * nEmbd * 2 + blockSize * nEmbd +
+  let pc = tok.vocab.len * nEmbd * 2 + blockSize * nEmbd +
     nLayer * (4 * nEmbd * nEmbd + 2 * ffnMul * nEmbd * nEmbd)
   styledEcho(styleBright, "  nimllm", resetStyle,
              fgBlack, "  ·  ", resetStyle,
-             $(paramCount div 1000000), "M params")
+             $(pc div 1000000), "M params")
   styledEcho(fgBlack, "  type to chat  ·  ctrl-c to exit")
   echo ""
 
-  var history: seq[int32]  # token history for context
+  var history: seq[int32]
 
   while true:
     stdout.styledWrite(fgGreen, "> ")
@@ -273,36 +307,6 @@ when isMainModule:
     let input = stdin.readLine().strip()
     if input.len == 0: continue
 
-    # Encode input
-    let inputTokens = tok.encode("<|user|> " & input & " <|assistant|> ")
-    for id in inputTokens:
-      history.add(int32(id))
-
-    # Generate response
-    var response = ""
-    var genTokens: seq[int32]
-
-    for _ in 0 ..< 200:  # max generation length
-      # Build context: keep last blockSize tokens
-      var context = history
-      if context.len > blockSize:
-        context = context[context.len - blockSize ..< context.len]
-
-      let logits = forwardOneToken(m, context, context.len)
-      freeStepAllocations()  # free GPU buffers from this forward pass
-      let tokenId = sample(logits)
-
-      # Stop on special tokens
-      if tokenId == tok.bosId or tokenId == tok.userId or
-         tokenId == tok.assistantId:
-        break
-
-      history.add(int32(tokenId))
-      genTokens.add(int32(tokenId))
-
-      let tokenStr = tok.vocab[tokenId]
-      stdout.write(tokenStr)
-      stdout.flushFile()
-
-    echo ""
+    let response = generate(m, tok, input, history)
+    echo response
     echo ""
