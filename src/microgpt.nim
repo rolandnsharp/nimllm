@@ -756,6 +756,32 @@ when isMainModule:
   let peakLr = if readMode: 0.00005f else: 0.0001f
   let minLr = if readMode: 0.000005f else: 0.00001f
   let gradAccum = 1      # batch 1 — research says it works with right settings
+
+  # Elastic weight consolidation for --read mode.
+  # Save current weights as anchor. After each optimizer step, pull weights
+  # back toward anchor. Prevents catastrophic forgetting of base knowledge.
+  type Anchor = object
+    bufs: seq[GpuBuf]
+  var anchor: Anchor
+  if readMode:
+    echo "  saving weight anchor for elastic pull..."
+    proc saveAnchor(buf: GpuBuf): GpuBuf =
+      result = gpuCreate(buf.numel)
+      gpuCopy(buf, result, buf.numel)
+    anchor.bufs.add(saveAnchor(m.wte))
+    anchor.bufs.add(saveAnchor(m.wpe))
+    anchor.bufs.add(saveAnchor(m.lmHead))
+    anchor.bufs.add(saveAnchor(m.lnFg))
+    for i in 0 ..< m.layers.len:
+      anchor.bufs.add(saveAnchor(m.layers[i].wq))
+      anchor.bufs.add(saveAnchor(m.layers[i].wk))
+      anchor.bufs.add(saveAnchor(m.layers[i].wv))
+      anchor.bufs.add(saveAnchor(m.layers[i].wo))
+      anchor.bufs.add(saveAnchor(m.layers[i].fc1))
+      anchor.bufs.add(saveAnchor(m.layers[i].fc2))
+      anchor.bufs.add(saveAnchor(m.layers[i].ln1g))
+      anchor.bufs.add(saveAnchor(m.layers[i].ln2g))
+
   echo &"training {numSteps} steps (grad_accum={gradAccum})..."
 
   let tStart = cpuTime()
@@ -820,6 +846,22 @@ when isMainModule:
     clipGradNorm(gradPtrs, gradSizes, 1.0f)
 
     adamUpdate(m, adam, lr, optStep, beta2 = 0.9999f, wd = 0.0f)
+
+    # Elastic pull: in read mode, gently pull weights back toward anchor.
+    # alpha=0.001 means each step moves 0.1% back toward base weights.
+    # This prevents the model from drifting too far from what it already knows.
+    if readMode and anchor.bufs.len > 0:
+      let alpha = 0.001f
+      var idx = 0
+      proc pull(buf: GpuBuf) =
+        gpu_elastic(buf.data, anchor.bufs[idx].data, alpha, cint(buf.numel))
+        idx += 1
+      pull(m.wte); pull(m.wpe); pull(m.lmHead); pull(m.lnFg)
+      for i in 0 ..< m.layers.len:
+        pull(m.layers[i].wq); pull(m.layers[i].wk)
+        pull(m.layers[i].wv); pull(m.layers[i].wo)
+        pull(m.layers[i].fc1); pull(m.layers[i].fc2)
+        pull(m.layers[i].ln1g); pull(m.layers[i].ln2g)
 
     zeroGrads(m)
     microStep = 0
