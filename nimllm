@@ -1,0 +1,101 @@
+#!/bin/bash
+## nimllm — A grockable language model you can grow
+##
+## Usage:
+##   nimllm train              Train on training_data.txt (chat + books + logs)
+##   nimllm chat               Interactive conversation
+##   nimllm read <file>        Absorb a text file into weights
+##   nimllm grow <checkpoint>  Load smaller model into current (larger) architecture
+##   nimllm feed               Feed all books in ~/data/books/ sequentially
+##   nimllm status             Show model info and training status
+##   nimllm build              Compile kernels + Nim binaries
+
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC="$DIR/src"
+ROOT="$(dirname "$DIR")"
+
+case "${1:-help}" in
+  train)
+    exec "$SRC/microgpt" "${@:2}"
+    ;;
+  chat)
+    exec "$SRC/chat"
+    ;;
+  read)
+    if [ -z "$2" ]; then
+      echo "usage: nimllm read <textfile>"
+      exit 1
+    fi
+    exec "$SRC/microgpt" --read "$2"
+    ;;
+  grow)
+    if [ -z "$2" ]; then
+      echo "usage: nimllm grow <old_checkpoint>"
+      echo "  Loads a smaller model into the current architecture."
+      echo "  Old knowledge preserved. New capacity learns from training."
+      exit 1
+    fi
+    exec "$SRC/microgpt" --grow "$2"
+    ;;
+  feed)
+    exec "$DIR/feed_books.sh"
+    ;;
+  build)
+    echo "compiling CUDA kernels..."
+    cd "$SRC" && nvcc -c -O2 -Xcompiler -fPIC -o kernels.o kernels.cu
+    echo "compiling microgpt..."
+    cd "$DIR" && nim c -d:release src/microgpt.nim
+    echo "compiling chat..."
+    nim c -d:release src/chat.nim
+    echo "done."
+    ;;
+  status)
+    echo "nimllm status"
+    echo "============="
+    if [ -f "$ROOT/nimllm.bin" ]; then
+      SIZE=$(du -h "$ROOT/nimllm.bin" | cut -f1)
+      echo "model:     $ROOT/nimllm.bin ($SIZE)"
+    else
+      echo "model:     not trained yet"
+    fi
+    if [ -f "$ROOT/tokenizer_nim.bin" ]; then
+      echo "tokenizer: $ROOT/tokenizer_nim.bin"
+    else
+      echo "tokenizer: not trained yet"
+    fi
+    if [ -f "$ROOT/training_data.txt" ]; then
+      LINES=$(wc -l < "$ROOT/training_data.txt")
+      SIZE=$(du -h "$ROOT/training_data.txt" | cut -f1)
+      echo "data:      $LINES docs, $SIZE"
+    fi
+    echo ""
+    echo "architecture: 12 layers, 768 dim, 12 heads (~95M params)"
+    echo "vocab: 4259 (BPE, 4000 merges)"
+    # Check if training is running
+    if pgrep -f "src/microgpt" > /dev/null 2>&1; then
+      echo ""
+      echo "TRAINING IN PROGRESS:"
+      tail -1 /tmp/nimllm_v2b_train.log 2>/dev/null || tail -1 /tmp/nimllm_train.log 2>/dev/null
+    fi
+    ;;
+  help|--help|-h)
+    echo "nimllm — a grockable language model you can grow"
+    echo ""
+    echo "commands:"
+    echo "  train              train on combined dataset"
+    echo "  chat               talk to your model"
+    echo "  read <file>        absorb a text file into weights"
+    echo "  grow <checkpoint>  expand model from smaller checkpoint"
+    echo "  feed               feed all books in ~/data/books/"
+    echo "  build              compile CUDA kernels + Nim binaries"
+    echo "  status             show model info"
+    echo ""
+    echo "https://github.com/rolandnsharp/nimllm"
+    ;;
+  *)
+    echo "unknown command: $1"
+    echo "run 'nimllm help' for usage"
+    exit 1
+    ;;
+esac
