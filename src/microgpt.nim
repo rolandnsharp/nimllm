@@ -24,12 +24,13 @@ const
 type
   Layer = object
     wq, wk, wv, wo: GpuBuf       # attention weights [nEmbd, nEmbd]
-    fc1: GpuBuf                    # MLP up [ffnMul*nEmbd, nEmbd]
-    fc2: GpuBuf                    # MLP down [nEmbd, ffnMul*nEmbd]
+    fcGate: GpuBuf                 # SwiGLU gate projection [ffnMul*nEmbd, nEmbd]
+    fcUp: GpuBuf                   # SwiGLU up projection [ffnMul*nEmbd, nEmbd]
+    fcDown: GpuBuf                 # SwiGLU down projection [nEmbd, ffnMul*nEmbd]
     ln1g, ln2g: GpuBuf            # learnable RMSNorm gamma [nEmbd]
     # Gradients
     dwq, dwk, dwv, dwo: GpuBuf
-    dfc1, dfc2: GpuBuf
+    dfcGate, dfcUp, dfcDown: GpuBuf
     dln1g, dln2g: GpuBuf
 
   Model = object
@@ -81,16 +82,18 @@ proc initModel(vocabSize: int): Model =
       wk: randBuf(nEmbd * nEmbd),
       wv: randBuf(nEmbd * nEmbd),
       wo: randBuf(nEmbd * nEmbd, resStd),
-      fc1: randBuf(ffnMul * nEmbd * nEmbd),
-      fc2: randBuf(nEmbd * ffnMul * nEmbd, resStd),
+      fcGate: randBuf(ffnMul * nEmbd * nEmbd),
+      fcUp: randBuf(ffnMul * nEmbd * nEmbd),
+      fcDown: randBuf(nEmbd * ffnMul * nEmbd, resStd),
       ln1g: onesBuf(nEmbd),
       ln2g: onesBuf(nEmbd),
       dwq: gpuCreate(nEmbd * nEmbd),
       dwk: gpuCreate(nEmbd * nEmbd),
       dwv: gpuCreate(nEmbd * nEmbd),
       dwo: gpuCreate(nEmbd * nEmbd),
-      dfc1: gpuCreate(ffnMul * nEmbd * nEmbd),
-      dfc2: gpuCreate(nEmbd * ffnMul * nEmbd),
+      dfcGate: gpuCreate(ffnMul * nEmbd * nEmbd),
+      dfcUp: gpuCreate(ffnMul * nEmbd * nEmbd),
+      dfcDown: gpuCreate(nEmbd * ffnMul * nEmbd),
       dln1g: gpuCreate(nEmbd),
       dln2g: gpuCreate(nEmbd),
     ))
@@ -111,8 +114,9 @@ proc initModel(vocabSize: int): Model =
   result.ropeCos = toGpu(cosTab)
   result.ropeSin = toGpu(sinTab)
 
-  let total = vocabSize * nEmbd * 2 + blockSize * nEmbd +
-    nLayer * (4 * nEmbd * nEmbd + 2 * ffnMul * nEmbd * nEmbd)
+  # SwiGLU has 3 FFN matrices (gate, up, down) instead of 2 (fc1, fc2). No wpe.
+  let total = vocabSize * nEmbd * 2 +
+    nLayer * (4 * nEmbd * nEmbd + 3 * ffnMul * nEmbd * nEmbd)
   echo &"  params: {total}"
 
 # ── Saved intermediates for backward ──────────────────────────────
@@ -127,8 +131,9 @@ type
     x2: GpuBuf           # after first residual (for residual + rmsnorm backward)
     xNorm2: GpuBuf       # after rmsnorm2
     rms2: GpuBuf         # rms value for rmsnorm2 backward
-    fc1Out: GpuBuf       # after fc1 (pre-activation)
-    geluOut: GpuBuf      # after GELU
+    fc1Out: GpuBuf       # SwiGLU gate output (pre-activation)
+    upOut: GpuBuf        # SwiGLU up output
+    geluOut: GpuBuf      # SwiGLU output: swish(gate) * up
 
   ForwardCache = object
     embedded: GpuBuf      # token + position embeddings
@@ -218,15 +223,18 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     lc.rms2 = trackedCreate(S)
     gpu_rmsnorm_affine_fwd(x.data, layer.ln2g.data, lc.xNorm2.data, lc.rms2.data, cint(S), cint(n))
 
-    # MLP: fc1 -> relu -> fc2
-    lc.fc1Out = trackedCreate(S * ffnMul * n)
-    gpuSgemm(2, S, ffnMul * n, n, lc.xNorm2, layer.fc1, lc.fc1Out)
+    # MLP: SwiGLU — gate and up projections, then swish(gate) * up, then down
+    lc.fc1Out = trackedCreate(S * ffnMul * n)  # gate projection
+    gpuSgemm(2, S, ffnMul * n, n, lc.xNorm2, layer.fcGate, lc.fc1Out)
 
-    lc.geluOut = trackedCreate(S * ffnMul * n)
-    gpu_gelu_fwd(lc.fc1Out.data, lc.geluOut.data, cint(S * ffnMul * n))
+    lc.upOut = trackedCreate(S * ffnMul * n)    # up projection
+    gpuSgemm(2, S, ffnMul * n, n, lc.xNorm2, layer.fcUp, lc.upOut)
+
+    lc.geluOut = trackedCreate(S * ffnMul * n)  # swish(gate) * up
+    gpu_swiglu_fwd(lc.fc1Out.data, lc.upOut.data, lc.geluOut.data, cint(S * ffnMul * n))
 
     var mlpOut = trackedCreate(S * n)
-    gpuSgemm(2, S, n, ffnMul * n, lc.geluOut, layer.fc2, mlpOut)
+    gpuSgemm(2, S, n, ffnMul * n, lc.geluOut, layer.fcDown, mlpOut)
 
     # Residual 2: x = x2 + mlpOut
     let xNew = trackedCreate(S * n)
@@ -298,19 +306,27 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
     gpuCopy(dx, dMlpOut, S * n)
     # dx also flows through residual (already in dx)
 
-    # MLP backward: fc2
-    let dReluOut = trackedCreate(S * ffnMul * n)
-    gpuSgemm(1, S, ffnMul * n, n, dMlpOut, layer.fc2, dReluOut)
-    gpuSgemm(5, n, ffnMul * n, S, dMlpOut, lc.geluOut, m.layers[li].dfc2)
+    # MLP backward: SwiGLU
+    # down projection backward
+    let dSwigluOut = trackedCreate(S * ffnMul * n)
+    gpuSgemm(1, S, ffnMul * n, n, dMlpOut, layer.fcDown, dSwigluOut)
+    gpuSgemm(5, n, ffnMul * n, S, dMlpOut, lc.geluOut, m.layers[li].dfcDown)
 
-    # GELU backward
-    let dFc1Out = trackedCreate(S * ffnMul * n)
-    gpu_gelu_bwd(lc.fc1Out.data, dReluOut.data, dFc1Out.data, cint(S * ffnMul * n))
+    # SwiGLU backward: dGate and dUp from dSwigluOut
+    let dGate = trackedCreate(S * ffnMul * n)
+    let dUp = trackedCreate(S * ffnMul * n)
+    gpu_swiglu_bwd(lc.fc1Out.data, lc.upOut.data, dSwigluOut.data,
+                   dGate.data, dUp.data, cint(S * ffnMul * n))
 
-    # fc1 backward
+    # Gate and up projection backward
     let dNorm2 = trackedCreate(S * n)
-    gpuSgemm(1, S, n, ffnMul * n, dFc1Out, layer.fc1, dNorm2)
-    gpuSgemm(5, ffnMul * n, n, S, dFc1Out, lc.xNorm2, m.layers[li].dfc1)
+    gpuSgemm(1, S, n, ffnMul * n, dGate, layer.fcGate, dNorm2)
+    gpuSgemm(5, ffnMul * n, n, S, dGate, lc.xNorm2, m.layers[li].dfcGate)
+
+    let dNorm2up = trackedCreate(S * n)
+    gpuSgemm(1, S, n, ffnMul * n, dUp, layer.fcUp, dNorm2up)
+    gpuSgemm(5, ffnMul * n, n, S, dUp, lc.xNorm2, m.layers[li].dfcUp)
+    gpu_add_inplace(dNorm2.data, dNorm2up.data, cint(S * n))
 
     # RMSNorm 2 backward
     let dResid2 = trackedCreate(S * n)
@@ -437,7 +453,7 @@ proc saveModel(m: Model, filename: string) =
   w(m.wte); w(m.lmHead); w(m.lnFg)
   for layer in m.layers:
     w(layer.wq); w(layer.wk); w(layer.wv); w(layer.wo)
-    w(layer.fc1); w(layer.fc2); w(layer.ln1g); w(layer.ln2g)
+    w(layer.fcGate); w(layer.fcUp); w(layer.fcDown); w(layer.ln1g); w(layer.ln2g)
   echo "  done"
 
 proc loadModel(m: var Model, filename: string) =
@@ -474,7 +490,7 @@ proc loadModel(m: var Model, filename: string) =
   for i in 0 ..< m.layers.len:
     r(m.layers[i].wq); r(m.layers[i].wk)
     r(m.layers[i].wv); r(m.layers[i].wo)
-    r(m.layers[i].fc1); r(m.layers[i].fc2)
+    r(m.layers[i].fcGate); r(m.layers[i].fcUp); r(m.layers[i].fcDown)
     r(m.layers[i].ln1g); r(m.layers[i].ln2g)
   echo "  done"
 
@@ -594,8 +610,9 @@ proc growModel(m: var Model, oldFile: string) =
     readGrowMatrix(m.layers[li].wk, oldEmbd, oldEmbd, nEmbd)
     readGrowMatrix(m.layers[li].wv, oldEmbd, oldEmbd, nEmbd)
     readGrowMatrix(m.layers[li].wo, oldEmbd, oldEmbd, nEmbd)
-    readGrowMatrix(m.layers[li].fc1, ffnMul * oldEmbd, oldEmbd, nEmbd)
-    readGrowMatrix(m.layers[li].fc2, oldEmbd, ffnMul * oldEmbd, ffnMul * nEmbd)
+    readGrowMatrix(m.layers[li].fcGate, ffnMul * oldEmbd, oldEmbd, nEmbd)
+    readGrowMatrix(m.layers[li].fcUp, ffnMul * oldEmbd, oldEmbd, nEmbd)
+    readGrowMatrix(m.layers[li].fcDown, oldEmbd, ffnMul * oldEmbd, ffnMul * nEmbd)
     readGrowVec(m.layers[li].ln1g, oldEmbd)
     readGrowVec(m.layers[li].ln2g, oldEmbd)
     li += 1
@@ -612,8 +629,9 @@ proc zeroGrads(m: var Model) =
     gpuZero(m.layers[i].dwk)
     gpuZero(m.layers[i].dwv)
     gpuZero(m.layers[i].dwo)
-    gpuZero(m.layers[i].dfc1)
-    gpuZero(m.layers[i].dfc2)
+    gpuZero(m.layers[i].dfcGate)
+    gpuZero(m.layers[i].dfcUp)
+    gpuZero(m.layers[i].dfcDown)
     gpuZero(m.layers[i].dln1g)
     gpuZero(m.layers[i].dln2g)
 
@@ -636,8 +654,9 @@ proc initAdam(m: Model): AdamState =
     addPair(result, layer.wo)
     addPair(result, layer.ln1g)
     addPair(result, layer.ln2g)
-    addPair(result, layer.fc1)
-    addPair(result, layer.fc2)
+    addPair(result, layer.fcGate)
+    addPair(result, layer.fcUp)
+    addPair(result, layer.fcDown)
 
 proc adamUpdate(m: var Model, adam: var AdamState, lr: float32,
                 step: int, beta1 = 0.9f, beta2 = 0.999f, wd = 0.1f) =
@@ -655,8 +674,9 @@ proc adamUpdate(m: var Model, adam: var AdamState, lr: float32,
     pairs.add((m.layers[i].wo, m.layers[i].dwo))
     pairs.add((m.layers[i].ln1g, m.layers[i].dln1g))
     pairs.add((m.layers[i].ln2g, m.layers[i].dln2g))
-    pairs.add((m.layers[i].fc1, m.layers[i].dfc1))
-    pairs.add((m.layers[i].fc2, m.layers[i].dfc2))
+    pairs.add((m.layers[i].fcGate, m.layers[i].dfcGate))
+    pairs.add((m.layers[i].fcUp, m.layers[i].dfcUp))
+    pairs.add((m.layers[i].fcDown, m.layers[i].dfcDown))
 
   for i in 0 ..< pairs.len:
     gpu_adamw(pairs[i][0].data, pairs[i][1].data,
@@ -805,8 +825,9 @@ when isMainModule:
       anchor.bufs.add(saveAnchor(m.layers[i].wk))
       anchor.bufs.add(saveAnchor(m.layers[i].wv))
       anchor.bufs.add(saveAnchor(m.layers[i].wo))
-      anchor.bufs.add(saveAnchor(m.layers[i].fc1))
-      anchor.bufs.add(saveAnchor(m.layers[i].fc2))
+      anchor.bufs.add(saveAnchor(m.layers[i].fcGate))
+      anchor.bufs.add(saveAnchor(m.layers[i].fcUp))
+      anchor.bufs.add(saveAnchor(m.layers[i].fcDown))
       anchor.bufs.add(saveAnchor(m.layers[i].ln1g))
       anchor.bufs.add(saveAnchor(m.layers[i].ln2g))
 
@@ -842,8 +863,9 @@ when isMainModule:
         gpu_scale(m.layers[i].dwk.data, s, m.layers[i].dwk.data, cint(m.layers[i].dwk.numel))
         gpu_scale(m.layers[i].dwv.data, s, m.layers[i].dwv.data, cint(m.layers[i].dwv.numel))
         gpu_scale(m.layers[i].dwo.data, s, m.layers[i].dwo.data, cint(m.layers[i].dwo.numel))
-        gpu_scale(m.layers[i].dfc1.data, s, m.layers[i].dfc1.data, cint(m.layers[i].dfc1.numel))
-        gpu_scale(m.layers[i].dfc2.data, s, m.layers[i].dfc2.data, cint(m.layers[i].dfc2.numel))
+        gpu_scale(m.layers[i].dfcGate.data, s, m.layers[i].dfcGate.data, cint(m.layers[i].dfcGate.numel))
+        gpu_scale(m.layers[i].dfcUp.data, s, m.layers[i].dfcUp.data, cint(m.layers[i].dfcUp.numel))
+        gpu_scale(m.layers[i].dfcDown.data, s, m.layers[i].dfcDown.data, cint(m.layers[i].dfcDown.numel))
     scaleAllGrads(m, 1.0f / float32(gradAccum))
 
     # LR schedule
@@ -865,8 +887,9 @@ when isMainModule:
       gradPtrs.add(m.layers[i].dwk.data); gradSizes.add(cint(m.layers[i].dwk.numel))
       gradPtrs.add(m.layers[i].dwv.data); gradSizes.add(cint(m.layers[i].dwv.numel))
       gradPtrs.add(m.layers[i].dwo.data); gradSizes.add(cint(m.layers[i].dwo.numel))
-      gradPtrs.add(m.layers[i].dfc1.data); gradSizes.add(cint(m.layers[i].dfc1.numel))
-      gradPtrs.add(m.layers[i].dfc2.data); gradSizes.add(cint(m.layers[i].dfc2.numel))
+      gradPtrs.add(m.layers[i].dfcGate.data); gradSizes.add(cint(m.layers[i].dfcGate.numel))
+      gradPtrs.add(m.layers[i].dfcUp.data); gradSizes.add(cint(m.layers[i].dfcUp.numel))
+      gradPtrs.add(m.layers[i].dfcDown.data); gradSizes.add(cint(m.layers[i].dfcDown.numel))
       gradPtrs.add(m.layers[i].dln1g.data); gradSizes.add(cint(m.layers[i].dln1g.numel))
       gradPtrs.add(m.layers[i].dln2g.data); gradSizes.add(cint(m.layers[i].dln2g.numel))
     clipGradNorm(gradPtrs, gradSizes, 1.0f)
@@ -886,7 +909,7 @@ when isMainModule:
       for i in 0 ..< m.layers.len:
         pull(m.layers[i].wq); pull(m.layers[i].wk)
         pull(m.layers[i].wv); pull(m.layers[i].wo)
-        pull(m.layers[i].fc1); pull(m.layers[i].fc2)
+        pull(m.layers[i].fcGate); pull(m.layers[i].fcUp); pull(m.layers[i].fcDown)
         pull(m.layers[i].ln1g); pull(m.layers[i].ln2g)
 
     zeroGrads(m)
