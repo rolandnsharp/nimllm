@@ -411,9 +411,22 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
 # ── Checkpoint ────────────────────────────────────────────────────
 
 proc saveModel(m: Model, filename: string) =
+  ## Save model with config header. Format:
+  ##   magic (4 bytes: "NLLM"), version (int32: 2),
+  ##   nLayer, nEmbd, nHead, vocabSize, blockSize (5 × int32),
+  ##   then weight buffers: each is int32(count) + float32[count]
   echo "saving to ", filename, "..."
   let s = newFileStream(filename, fmWrite)
   defer: s.close()
+  # Header
+  s.writeData("NLLM".cstring, 4)
+  s.write(int32(2))          # version
+  s.write(int32(nLayer))
+  s.write(int32(nEmbd))
+  s.write(int32(nHead))
+  s.write(int32(m.vocabSize))
+  s.write(int32(blockSize))
+  # Weights
   proc w(buf: GpuBuf) =
     let d = gpuDownload(buf)
     s.write(int32(d.len))
@@ -425,9 +438,30 @@ proc saveModel(m: Model, filename: string) =
   echo "  done"
 
 proc loadModel(m: var Model, filename: string) =
+  ## Load model checkpoint. Reads header to verify config matches.
   echo "loading from ", filename, "..."
   let s = newFileStream(filename, fmRead)
   defer: s.close()
+  # Check for header (v2 format starts with "NLLM")
+  var magic: array[4, char]
+  discard s.readData(addr magic[0], 4)
+  if magic == ['N', 'L', 'L', 'M']:
+    let ver = s.readInt32()
+    let fLayer = s.readInt32().int
+    let fEmbd = s.readInt32().int
+    let fHead = s.readInt32().int
+    let fVocab = s.readInt32().int
+    let fBlock = s.readInt32().int
+    echo &"  checkpoint: {fLayer}L {fEmbd}d {fHead}h vocab={fVocab} block={fBlock} (v{ver})"
+    if fLayer != nLayer or fEmbd != nEmbd or fHead != nHead:
+      echo "  WARNING: config mismatch! Use --grow instead."
+      echo &"    checkpoint: {fLayer}L {fEmbd}d {fHead}h"
+      echo &"    current:    {nLayer}L {nEmbd}d {nHead}h"
+      quit(1)
+  else:
+    # Legacy format (no header) — rewind and read directly
+    echo "  (legacy format, no header)"
+    s.setPosition(0)
   proc r(buf: GpuBuf) =
     let n = s.readInt32().int
     var d = newSeq[float32](n)
