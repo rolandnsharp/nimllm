@@ -76,6 +76,18 @@ proc loadModel(m: var Model, filename: string) =
   echo "loading brain from ", filename, "..."
   let s = newFileStream(filename, fmRead)
   defer: s.close()
+  # Skip v2 header if present
+  var magic: array[4, char]
+  discard s.readData(addr magic[0], 4)
+  if magic == ['N', 'L', 'L', 'M']:
+    discard s.readInt32()  # version
+    discard s.readInt32()  # nLayer
+    discard s.readInt32()  # nEmbd
+    discard s.readInt32()  # nHead
+    discard s.readInt32()  # vocabSize
+    discard s.readInt32()  # blockSize
+  else:
+    s.setPosition(0)  # legacy format, rewind
   proc r(buf: GpuBuf) =
     let n = s.readInt32().int
     var d = newSeq[float32](n)
