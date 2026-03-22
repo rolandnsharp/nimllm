@@ -28,10 +28,11 @@ type
     dln1g, dln2g: GpuBuf
 
   Model = object
-    wte, wpe, lmHead, lnFg: GpuBuf
+    wte, lmHead, lnFg: GpuBuf
     layers: seq[Layer]
     vocabSize: int
-    dwte, dwpe, dlmHead, dlnFg: GpuBuf
+    dwte, dlmHead, dlnFg: GpuBuf
+    ropeCos, ropeSin: GpuBuf
 
 proc initModel(vocabSize: int): Model =
   randomize(42)
@@ -50,13 +51,22 @@ proc initModel(vocabSize: int): Model =
 
   result.vocabSize = vocabSize
   result.wte = randBuf(vocabSize * nEmbd)
-  result.wpe = randBuf(blockSize * nEmbd)
   result.lmHead = randBuf(vocabSize * nEmbd)
   result.lnFg = onesBuf(nEmbd)
   result.dwte = gpuCreate(vocabSize * nEmbd)
-  result.dwpe = gpuCreate(blockSize * nEmbd)
   result.dlmHead = gpuCreate(vocabSize * nEmbd)
   result.dlnFg = gpuCreate(nEmbd)
+  # RoPE tables
+  let halfDim = headDim div 2
+  var cosTab = newSeq[float32](blockSize * halfDim)
+  var sinTab = newSeq[float32](blockSize * halfDim)
+  for pos in 0 ..< blockSize:
+    for f in 0 ..< halfDim:
+      let theta = float32(pos) / pow(10000.0f, 2.0f * float32(f) / float32(headDim))
+      cosTab[pos * halfDim + f] = cos(theta)
+      sinTab[pos * halfDim + f] = sin(theta)
+  result.ropeCos = toGpu(cosTab)
+  result.ropeSin = toGpu(sinTab)
   let resStd = std / sqrt(float32(2 * nLayer))
   for i in 0 ..< nLayer:
     result.layers.add(Layer(
@@ -93,7 +103,7 @@ proc loadModel(m: var Model, filename: string) =
     var d = newSeq[float32](n)
     for i in 0 ..< n: d[i] = s.readFloat32()
     gpuUpload(buf, d)
-  r(m.wte); r(m.wpe); r(m.lmHead); r(m.lnFg)
+  r(m.wte); r(m.lmHead); r(m.lnFg)
   for i in 0 ..< m.layers.len:
     r(m.layers[i].wq); r(m.layers[i].wk)
     r(m.layers[i].wv); r(m.layers[i].wo)
@@ -108,27 +118,14 @@ proc forwardOneToken(m: Model, tokenIds: seq[int32], seqLen: int): seq[float32] 
   let n = nEmbd
   let S = seqLen
 
-  # Embedding
-  let tokEmb = trackedCreate(S * n)
+  # Token embedding (RoPE handles position — no positional embedding)
+  var x = trackedCreate(S * n)
   var tokBuf: pointer
   discard cudaMalloc(addr tokBuf, csize_t(S * sizeof(int32)))
   discard cudaMemcpy(tokBuf, unsafeAddr tokenIds[0],
                      csize_t(S * sizeof(int32)), CudaMemcpyHostToDevice)
-  gpu_embed_fwd(m.wte.data, tokBuf, tokEmb.data, cint(S), cint(n))
-
-  let posEmb = trackedCreate(S * n)
-  var posIds = newSeq[int32](S)
-  for i in 0 ..< S: posIds[i] = int32(i)
-  var posBuf: pointer
-  discard cudaMalloc(addr posBuf, csize_t(S * sizeof(int32)))
-  discard cudaMemcpy(posBuf, unsafeAddr posIds[0],
-                     csize_t(S * sizeof(int32)), CudaMemcpyHostToDevice)
-  gpu_embed_fwd(m.wpe.data, posBuf, posEmb.data, cint(S), cint(n))
-
-  var x = trackedCreate(S * n)
-  gpu_add(tokEmb.data, posEmb.data, x.data, cint(S * n))
+  gpu_embed_fwd(m.wte.data, tokBuf, x.data, cint(S), cint(n))
   discard cudaFree(tokBuf)
-  discard cudaFree(posBuf)
 
   let scale = 1.0f / sqrt(float32(headDim))
   let qH = trackedCreate(S * headDim)
@@ -149,6 +146,10 @@ proc forwardOneToken(m: Model, tokenIds: seq[int32], seqLen: int): seq[float32] 
     let v = trackedCreate(S * n)
     gpuSgemm(2, S, n, n, xNorm, layer.wq, q)
     gpuSgemm(2, S, n, n, xNorm, layer.wk, k)
+
+    # RoPE: rotate Q and K by position
+    ropeFwd(q, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
+    ropeFwd(k, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
     gpuSgemm(2, S, n, n, xNorm, layer.wv, v)
 
     # cuBLAS attention: fast matmuls + custom softmax/mask

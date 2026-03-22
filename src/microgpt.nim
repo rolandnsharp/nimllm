@@ -34,18 +34,19 @@ type
 
   Model = object
     wte: GpuBuf                    # token embeddings [vocab, nEmbd]
-    wpe: GpuBuf                    # position embeddings [blockSize, nEmbd]
     lmHead: GpuBuf                 # output projection [vocab, nEmbd]
     lnFg: GpuBuf                   # final RMSNorm gamma [nEmbd]
     layers: seq[Layer]
     vocabSize: int
     # Gradients
-    dwte, dwpe, dlmHead: GpuBuf
+    dwte, dlmHead: GpuBuf
     dlnFg: GpuBuf
-    # Pre-allocated token/position ID buffers (avoid cudaMalloc per step)
+    # Pre-allocated buffers
     tokIdBuf: pointer              # [blockSize] int32 on GPU — input tokens
-    posIdBuf: pointer              # [blockSize] int32 on GPU — 0,1,2,...
     targetIdBuf: pointer           # [blockSize] int32 on GPU — target tokens (shifted by 1)
+    # RoPE tables (precomputed, shared across all layers)
+    ropeCos: GpuBuf                # [blockSize, headDim/2]
+    ropeSin: GpuBuf                # [blockSize, headDim/2]
 
 proc initModel(vocabSize: int): Model =
   randomize(42)
@@ -61,10 +62,8 @@ proc initModel(vocabSize: int): Model =
 
   result.vocabSize = vocabSize
   result.wte = randBuf(vocabSize * nEmbd)
-  result.wpe = randBuf(blockSize * nEmbd)
   result.lmHead = randBuf(vocabSize * nEmbd)
   result.dwte = gpuCreate(vocabSize * nEmbd)
-  result.dwpe = gpuCreate(blockSize * nEmbd)
   result.dlmHead = gpuCreate(vocabSize * nEmbd)
 
   proc onesBuf(n: int): GpuBuf =
@@ -96,15 +95,21 @@ proc initModel(vocabSize: int): Model =
       dln2g: gpuCreate(nEmbd),
     ))
 
-  # Pre-allocate token/position ID buffers on GPU
+  # Pre-allocate token ID buffers on GPU
   discard cudaMalloc(addr result.tokIdBuf, csize_t(blockSize * sizeof(int32)))
-  discard cudaMalloc(addr result.posIdBuf, csize_t(blockSize * sizeof(int32)))
   discard cudaMalloc(addr result.targetIdBuf, csize_t(blockSize * sizeof(int32)))
-  # Fill position IDs once (0, 1, 2, ..., blockSize-1) — never changes
-  var posIds = newSeq[int32](blockSize)
-  for i in 0 ..< blockSize: posIds[i] = int32(i)
-  discard cudaMemcpy(result.posIdBuf, unsafeAddr posIds[0],
-                     csize_t(blockSize * sizeof(int32)), CudaMemcpyHostToDevice)
+
+  # Precompute RoPE cos/sin tables: theta_f = pos / 10000^(2f/headDim)
+  let halfDim = headDim div 2
+  var cosTab = newSeq[float32](blockSize * halfDim)
+  var sinTab = newSeq[float32](blockSize * halfDim)
+  for pos in 0 ..< blockSize:
+    for f in 0 ..< halfDim:
+      let theta = float32(pos) / pow(10000.0f, 2.0f * float32(f) / float32(headDim))
+      cosTab[pos * halfDim + f] = cos(theta)
+      sinTab[pos * halfDim + f] = sin(theta)
+  result.ropeCos = toGpu(cosTab)
+  result.ropeSin = toGpu(sinTab)
 
   let total = vocabSize * nEmbd * 2 + blockSize * nEmbd +
     nLayer * (4 * nEmbd * nEmbd + 2 * ffnMul * nEmbd * nEmbd)
@@ -141,18 +146,11 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
   let n = nEmbd
   let S = seqLen
 
-  # Embedding: tok + pos (using pre-allocated ID buffers)
-  let tokEmb = trackedCreate(S * n)
+  # Token embedding (no positional embedding — RoPE handles position)
+  var x = trackedCreate(S * n)
   discard cudaMemcpy(m.tokIdBuf, unsafeAddr tokens[0],
                      csize_t(S * sizeof(int32)), CudaMemcpyHostToDevice)
-  gpu_embed_fwd(m.wte.data, m.tokIdBuf, tokEmb.data, cint(S), cint(n))
-
-  let posEmb = trackedCreate(S * n)
-  # posIdBuf already has 0,1,2,...,blockSize-1 from init
-  gpu_embed_fwd(m.wpe.data, m.posIdBuf, posEmb.data, cint(S), cint(n))
-
-  var x = trackedCreate(S * n)
-  gpu_add(tokEmb.data, posEmb.data, x.data, cint(S * n))
+  gpu_embed_fwd(m.wte.data, m.tokIdBuf, x.data, cint(S), cint(n))
   cache.embedded = x
 
   # Transformer layers
@@ -174,6 +172,10 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     gpuSgemm(2, S, n, n, lc.xNorm1, layer.wq, lc.q)
     gpuSgemm(2, S, n, n, lc.xNorm1, layer.wk, lc.k)
     gpuSgemm(2, S, n, n, lc.xNorm1, layer.wv, lc.v)
+
+    # RoPE: rotate Q and K by position (replaces learned positional embedding)
+    ropeFwd(lc.q, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
+    ropeFwd(lc.k, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
 
     # Multi-head attention via cuBLAS — fast matmuls + custom softmax/mask.
     let scale = 1.0f / sqrt(float32(headDim))
@@ -376,6 +378,10 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
       insertHeadAcc(dkH, dk, h, S, n, headDim)
       insertHeadAcc(dvH, dv, h, S, n, headDim)
 
+    # Inverse RoPE on dQ and dK before QKV weight backward
+    ropeBwd(dq, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
+    ropeBwd(dk, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
+
     # QKV projection backward
     let dNorm1 = trackedCreate(S * n)
     gpuSgemm(1, S, n, n, dq, layer.wq, dNorm1)
@@ -400,11 +406,8 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
     # Residual 1: dx for next layer = dResid1 + dResid2_skip
     gpu_add(dResid1.data, dx.data, dx.data, cint(S * n))
 
-  # Embedding backward (using pre-allocated ID buffers)
-  # tokIdBuf still has this step's token IDs from forward
+  # Embedding backward (no position embedding — RoPE has no learnable params)
   gpu_embed_bwd(m.dwte.data, m.tokIdBuf, dx.data, cint(S), cint(n))
-  # posIdBuf still has 0,1,2,...,blockSize-1 from init
-  gpu_embed_bwd(m.dwpe.data, m.posIdBuf, dx.data, cint(S), cint(n))
 
 # ── Zero gradients ────────────────────────────────────────────────
 
@@ -431,7 +434,7 @@ proc saveModel(m: Model, filename: string) =
     let d = gpuDownload(buf)
     s.write(int32(d.len))
     for v in d: s.write(v)
-  w(m.wte); w(m.wpe); w(m.lmHead); w(m.lnFg)
+  w(m.wte); w(m.lmHead); w(m.lnFg)
   for layer in m.layers:
     w(layer.wq); w(layer.wk); w(layer.wv); w(layer.wo)
     w(layer.fc1); w(layer.fc2); w(layer.ln1g); w(layer.ln2g)
@@ -467,7 +470,7 @@ proc loadModel(m: var Model, filename: string) =
     var d = newSeq[float32](n)
     for i in 0 ..< n: d[i] = s.readFloat32()
     gpuUpload(buf, d)
-  r(m.wte); r(m.wpe); r(m.lmHead); r(m.lnFg)
+  r(m.wte); r(m.lmHead); r(m.lnFg)
   for i in 0 ..< m.layers.len:
     r(m.layers[i].wq); r(m.layers[i].wk)
     r(m.layers[i].wv); r(m.layers[i].wo)
@@ -542,12 +545,7 @@ proc growModel(m: var Model, oldFile: string) =
       wte[r * nEmbd + c] = wteOld[r * oldEmbd + c]
   gpuUpload(m.wte, wte)
 
-  # Grow wpe [blockSize, embd]
-  var wpe = gpuDownload(m.wpe)
-  for r in 0 ..< blockSize:
-    for c in 0 ..< min(oldEmbd, nEmbd):
-      wpe[r * nEmbd + c] = wpeOld[r * oldEmbd + c]
-  gpuUpload(m.wpe, wpe)
+  # Skip wpe from old checkpoint (RoPE replaces it, no wpe in new model)
 
   # Read and grow lmHead [vocab, embd]
   let lmN = s.readInt32().int
@@ -607,7 +605,6 @@ proc growModel(m: var Model, oldFile: string) =
 
 proc zeroGrads(m: var Model) =
   gpuZero(m.dwte)
-  gpuZero(m.dwpe)
   gpuZero(m.dlmHead)
   gpuZero(m.dlnFg)
   for i in 0 ..< m.layers.len:
@@ -630,7 +627,6 @@ proc initAdam(m: Model): AdamState =
     s.m.add(gpuCreate(buf.numel))
     s.v.add(gpuCreate(buf.numel))
   addPair(result, m.wte)
-  addPair(result, m.wpe)
   addPair(result, m.lmHead)
   addPair(result, m.lnFg)
   for layer in m.layers:
@@ -650,7 +646,6 @@ proc adamUpdate(m: var Model, adam: var AdamState, lr: float32,
 
   var pairs: seq[(GpuBuf, GpuBuf)] # (param, grad)
   pairs.add((m.wte, m.dwte))
-  pairs.add((m.wpe, m.dwpe))
   pairs.add((m.lmHead, m.dlmHead))
   pairs.add((m.lnFg, m.dlnFg))
   for i in 0 ..< m.layers.len:
@@ -803,7 +798,6 @@ when isMainModule:
       result = gpuCreate(buf.numel)
       gpuCopy(buf, result, buf.numel)
     anchor.bufs.add(saveAnchor(m.wte))
-    anchor.bufs.add(saveAnchor(m.wpe))
     anchor.bufs.add(saveAnchor(m.lmHead))
     anchor.bufs.add(saveAnchor(m.lnFg))
     for i in 0 ..< m.layers.len:
@@ -842,7 +836,6 @@ when isMainModule:
     # Scale gradients by 1/gradAccum
     proc scaleAllGrads(m: var Model, s: float32) =
       gpu_scale(m.dwte.data, s, m.dwte.data, cint(m.dwte.numel))
-      gpu_scale(m.dwpe.data, s, m.dwpe.data, cint(m.dwpe.numel))
       gpu_scale(m.dlmHead.data, s, m.dlmHead.data, cint(m.dlmHead.numel))
       for i in 0 ..< m.layers.len:
         gpu_scale(m.layers[i].dwq.data, s, m.layers[i].dwq.data, cint(m.layers[i].dwq.numel))
@@ -865,7 +858,6 @@ when isMainModule:
     var gradPtrs: seq[pointer]
     var gradSizes: seq[cint]
     gradPtrs.add(m.dwte.data); gradSizes.add(cint(m.dwte.numel))
-    gradPtrs.add(m.dwpe.data); gradSizes.add(cint(m.dwpe.numel))
     gradPtrs.add(m.dlmHead.data); gradSizes.add(cint(m.dlmHead.numel))
     gradPtrs.add(m.dlnFg.data); gradSizes.add(cint(m.dlnFg.numel))
     for i in 0 ..< m.layers.len:
@@ -890,7 +882,7 @@ when isMainModule:
       proc pull(buf: GpuBuf) =
         gpu_elastic(buf.data, anchor.bufs[idx].data, alpha, cint(buf.numel))
         idx += 1
-      pull(m.wte); pull(m.wpe); pull(m.lmHead); pull(m.lnFg)
+      pull(m.wte); pull(m.lmHead); pull(m.lnFg)
       for i in 0 ..< m.layers.len:
         pull(m.layers[i].wq); pull(m.layers[i].wk)
         pull(m.layers[i].wv); pull(m.layers[i].wo)
