@@ -257,9 +257,11 @@ when isMainModule:
   trackingEnabled = true
 
   echo ""
+  let paramCount = tok.vocab.len * nEmbd * 2 + blockSize * nEmbd +
+    nLayer * (4 * nEmbd * nEmbd + 2 * ffnMul * nEmbd * nEmbd)
   styledEcho(styleBright, "  nimllm", resetStyle,
              fgBlack, "  ·  ", resetStyle,
-             "28M params  ·  loss 2.0")
+             $(paramCount div 1000000), "M params")
   styledEcho(fgBlack, "  type to chat  ·  ctrl-c to exit")
   echo ""
 
