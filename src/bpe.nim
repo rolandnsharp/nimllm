@@ -47,12 +47,14 @@ proc buildBaseVocab(): (seq[string], Table[string, int]) =
 
 # ── Training ──────────────────────────────────────────────────────
 
-proc countPairs(corpus: seq[seq[int]]): CountTable[(int, int)] =
+proc countPairs(corpus: seq[seq[int]], specialIds: set[uint16]): CountTable[(int, int)] =
   ## Count adjacent token pairs across all documents.
+  ## Never count pairs involving special tokens — they must stay atomic.
   result = initCountTable[(int, int)]()
   for doc in corpus:
     for i in 0 ..< doc.len - 1:
-      result.inc((doc[i], doc[i + 1]))
+      if doc[i].uint16 notin specialIds and doc[i+1].uint16 notin specialIds:
+        result.inc((doc[i], doc[i + 1]))
 
 proc mergePair(corpus: var seq[seq[int]], pair: (int, int), newId: int) =
   ## Replace all occurrences of pair with newId in-place.
@@ -106,9 +108,14 @@ proc trainBpe*(docs: seq[string], numMerges: int = nMerges,
 
   echo "training BPE: ", trainDocs.len, " docs (of ", docs.len, " total), base vocab: ", vocab.len
 
+  # Special tokens that must never be merged with adjacent tokens
+  let specialIds = {tokenToId[bosToken].uint16,
+                    tokenToId[userToken].uint16,
+                    tokenToId[assistantToken].uint16}
+
   # Iteratively merge the most frequent pair
   for m in 0 ..< numMerges:
-    let pairs = countPairs(corpus)
+    let pairs = countPairs(corpus, specialIds)
     if pairs.len == 0:
       break
     let (bestPair, _) = pairs.largest()
