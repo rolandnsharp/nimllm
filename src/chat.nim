@@ -11,9 +11,13 @@ const
   nLayer   = 12
   nEmbd    = 768
   nHead    = 12
-  headDim  = nEmbd div nHead
+  nKvHead  = 4
+  headDim  = nEmbd div nHead  # 64
+  kvRepeat = nHead div nKvHead  # 3
+  nKvDim   = nKvHead * headDim  # 256
   blockSize = 512
   ffnMul   = 4
+  ropeTheta = 500000.0f
 
 # Import the model type and forward from microgpt
 # For now, duplicate the minimal types needed
@@ -21,10 +25,10 @@ const
 type
   Layer = object
     wq, wk, wv, wo: GpuBuf
-    fc1, fc2: GpuBuf
+    fcGate, fcUp, fcDown: GpuBuf
     ln1g, ln2g: GpuBuf
     dwq, dwk, dwv, dwo: GpuBuf
-    dfc1, dfc2: GpuBuf
+    dfcGate, dfcUp, dfcDown: GpuBuf
     dln1g, dln2g: GpuBuf
 
   Model = object
@@ -62,7 +66,7 @@ proc initModel(vocabSize: int): Model =
   var sinTab = newSeq[float32](blockSize * halfDim)
   for pos in 0 ..< blockSize:
     for f in 0 ..< halfDim:
-      let theta = float32(pos) / pow(10000.0f, 2.0f * float32(f) / float32(headDim))
+      let theta = float32(pos) / pow(ropeTheta, 2.0f * float32(f) / float32(headDim))
       cosTab[pos * halfDim + f] = cos(theta)
       sinTab[pos * halfDim + f] = sin(theta)
   result.ropeCos = toGpu(cosTab)
@@ -70,15 +74,21 @@ proc initModel(vocabSize: int): Model =
   let resStd = std / sqrt(float32(2 * nLayer))
   for i in 0 ..< nLayer:
     result.layers.add(Layer(
-      wq: randBuf(nEmbd * nEmbd), wk: randBuf(nEmbd * nEmbd),
-      wv: randBuf(nEmbd * nEmbd), wo: randBuf(nEmbd * nEmbd, resStd),
-      fc1: randBuf(ffnMul * nEmbd * nEmbd),
-      fc2: randBuf(nEmbd * ffnMul * nEmbd, resStd),
+      wq: randBuf(nEmbd * nEmbd),
+      wk: randBuf(nKvDim * nEmbd),
+      wv: randBuf(nKvDim * nEmbd),
+      wo: randBuf(nEmbd * nEmbd, resStd),
+      fcGate: randBuf(ffnMul * nEmbd * nEmbd),
+      fcUp: randBuf(ffnMul * nEmbd * nEmbd),
+      fcDown: randBuf(nEmbd * ffnMul * nEmbd, resStd),
       ln1g: onesBuf(nEmbd), ln2g: onesBuf(nEmbd),
-      dwq: gpuCreate(nEmbd * nEmbd), dwk: gpuCreate(nEmbd * nEmbd),
-      dwv: gpuCreate(nEmbd * nEmbd), dwo: gpuCreate(nEmbd * nEmbd),
-      dfc1: gpuCreate(ffnMul * nEmbd * nEmbd),
-      dfc2: gpuCreate(nEmbd * ffnMul * nEmbd),
+      dwq: gpuCreate(nEmbd * nEmbd),
+      dwk: gpuCreate(nKvDim * nEmbd),
+      dwv: gpuCreate(nKvDim * nEmbd),
+      dwo: gpuCreate(nEmbd * nEmbd),
+      dfcGate: gpuCreate(ffnMul * nEmbd * nEmbd),
+      dfcUp: gpuCreate(ffnMul * nEmbd * nEmbd),
+      dfcDown: gpuCreate(nEmbd * ffnMul * nEmbd),
       dln1g: gpuCreate(nEmbd), dln2g: gpuCreate(nEmbd),
     ))
 
@@ -107,7 +117,7 @@ proc loadModel(m: var Model, filename: string) =
   for i in 0 ..< m.layers.len:
     r(m.layers[i].wq); r(m.layers[i].wk)
     r(m.layers[i].wv); r(m.layers[i].wo)
-    r(m.layers[i].fc1); r(m.layers[i].fc2)
+    r(m.layers[i].fcGate); r(m.layers[i].fcUp); r(m.layers[i].fcDown)
     r(m.layers[i].ln1g); r(m.layers[i].ln2g)
   echo "  done"
 
@@ -142,22 +152,24 @@ proc forwardOneToken(m: Model, tokenIds: seq[int32], seqLen: int): seq[float32] 
     gpu_rmsnorm_affine_fwd(x.data, layer.ln1g.data, xNorm.data, rms.data, cint(S), cint(n))
 
     let q = trackedCreate(S * n)
-    let k = trackedCreate(S * n)
-    let v = trackedCreate(S * n)
+    let k = trackedCreate(S * nKvDim)
+    let v = trackedCreate(S * nKvDim)
     gpuSgemm(2, S, n, n, xNorm, layer.wq, q)
-    gpuSgemm(2, S, n, n, xNorm, layer.wk, k)
+    gpuSgemm(2, S, nKvDim, n, xNorm, layer.wk, k)
+    gpuSgemm(2, S, nKvDim, n, xNorm, layer.wv, v)
 
     # RoPE: rotate Q and K by position
     ropeFwd(q, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
-    ropeFwd(k, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
-    gpuSgemm(2, S, n, n, xNorm, layer.wv, v)
+    ropeFwd(k, m.ropeCos, m.ropeSin, S, nKvDim, nKvHead, headDim)
 
-    # cuBLAS attention: fast matmuls + custom softmax/mask
+    # GQA attention via cuBLAS
     let attnOut = trackedCreate(S * n)
     for h in 0 ..< nHead:
       extractHead(q, qH, h, S, n, headDim)
-      extractHead(k, kH, h, S, n, headDim)
-      extractHead(v, vH, h, S, n, headDim)
+      gpu_extract_kv_head(k.data, kH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
+      gpu_extract_kv_head(v.data, vH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
       gpuSgemm(2, S, S, headDim, qH, kH, scores)
       causalMask(scores, scale, S)
       softmaxFwd(scores, probs, S, S)
@@ -173,12 +185,15 @@ proc forwardOneToken(m: Model, tokenIds: seq[int32], seqLen: int): seq[float32] 
     let rms2 = trackedCreate(S)
     gpu_rmsnorm_affine_fwd(x2.data, layer.ln2g.data, xNorm2.data, rms2.data, cint(S), cint(n))
 
-    let fc1Out = trackedCreate(S * ffnMul * n)
-    gpuSgemm(2, S, ffnMul * n, n, xNorm2, layer.fc1, fc1Out)
-    let geluOut = trackedCreate(S * ffnMul * n)
-    gpu_gelu_fwd(fc1Out.data, geluOut.data, cint(S * ffnMul * n))
+    # SwiGLU FFN
+    let gateOut = trackedCreate(S * ffnMul * n)
+    gpuSgemm(2, S, ffnMul * n, n, xNorm2, layer.fcGate, gateOut)
+    let upOut = trackedCreate(S * ffnMul * n)
+    gpuSgemm(2, S, ffnMul * n, n, xNorm2, layer.fcUp, upOut)
+    let swigluOut = trackedCreate(S * ffnMul * n)
+    gpu_swiglu_fwd(gateOut.data, upOut.data, swigluOut.data, cint(S * ffnMul * n))
     let mlpOut = trackedCreate(S * n)
-    gpuSgemm(2, S, n, ffnMul * n, geluOut, layer.fc2, mlpOut)
+    gpuSgemm(2, S, n, ffnMul * n, swigluOut, layer.fcDown, mlpOut)
 
     let xNew = trackedCreate(S * n)
     gpu_add(x2.data, mlpOut.data, xNew.data, cint(S * n))

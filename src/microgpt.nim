@@ -15,12 +15,13 @@ const
   nLayer   = 12
   nEmbd    = 768
   nHead    = 12          # query heads
-  nKvHead  = 4           # key/value heads (GQA: fewer KV heads than Q heads)
+  nKvHead  = 4           # key/value heads (GQA: 3:1 ratio)
   headDim  = nEmbd div nHead  # 64
-  kvRepeat = nHead div nKvHead  # 3 (each KV head serves 3 Q heads)
-  nKvDim   = nKvHead * headDim  # total KV dimension
+  kvRepeat = nHead div nKvHead  # 3
+  nKvDim   = nKvHead * headDim  # 256
   blockSize = 512
   ffnMul   = 4
+  ropeTheta = 500000.0f
 
 # ── Model ─────────────────────────────────────────────────────────
 
@@ -114,7 +115,7 @@ proc initModel(vocabSize: int): Model =
   var sinTab = newSeq[float32](blockSize * halfDim)
   for pos in 0 ..< blockSize:
     for f in 0 ..< halfDim:
-      let theta = float32(pos) / pow(10000.0f, 2.0f * float32(f) / float32(headDim))
+      let theta = float32(pos) / pow(ropeTheta, 2.0f * float32(f) / float32(headDim))
       cosTab[pos * halfDim + f] = cos(theta)
       sinTab[pos * halfDim + f] = sin(theta)
   result.ropeCos = toGpu(cosTab)
