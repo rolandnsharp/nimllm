@@ -14,8 +14,11 @@ import std/[math, random, strformat, os, streams, times]
 const
   nLayer   = 12
   nEmbd    = 768
-  nHead    = 12
+  nHead    = 12          # query heads
+  nKvHead  = 4           # key/value heads (GQA: fewer KV heads than Q heads)
   headDim  = nEmbd div nHead  # 64
+  kvRepeat = nHead div nKvHead  # 3 (each KV head serves 3 Q heads)
+  nKvDim   = nKvHead * headDim  # total KV dimension
   blockSize = 512
   ffnMul   = 4
 
@@ -23,11 +26,14 @@ const
 
 type
   Layer = object
-    wq, wk, wv, wo: GpuBuf       # attention weights [nEmbd, nEmbd]
-    fcGate: GpuBuf                 # SwiGLU gate projection [ffnMul*nEmbd, nEmbd]
-    fcUp: GpuBuf                   # SwiGLU up projection [ffnMul*nEmbd, nEmbd]
-    fcDown: GpuBuf                 # SwiGLU down projection [nEmbd, ffnMul*nEmbd]
-    ln1g, ln2g: GpuBuf            # learnable RMSNorm gamma [nEmbd]
+    wq: GpuBuf                    # Q projection [nEmbd, nEmbd]
+    wk: GpuBuf                    # K projection [nKvDim, nEmbd] (GQA: fewer KV heads)
+    wv: GpuBuf                    # V projection [nKvDim, nEmbd]
+    wo: GpuBuf                    # output projection [nEmbd, nEmbd]
+    fcGate: GpuBuf                 # SwiGLU gate [ffnMul*nEmbd, nEmbd]
+    fcUp: GpuBuf                   # SwiGLU up [ffnMul*nEmbd, nEmbd]
+    fcDown: GpuBuf                 # SwiGLU down [nEmbd, ffnMul*nEmbd]
+    ln1g, ln2g: GpuBuf            # RMSNorm gamma [nEmbd]
     # Gradients
     dwq, dwk, dwv, dwo: GpuBuf
     dfcGate, dfcUp, dfcDown: GpuBuf
@@ -79,8 +85,8 @@ proc initModel(vocabSize: int): Model =
     let resStd = std / sqrt(float32(2 * nLayer))
     result.layers.add(Layer(
       wq: randBuf(nEmbd * nEmbd),
-      wk: randBuf(nEmbd * nEmbd),
-      wv: randBuf(nEmbd * nEmbd),
+      wk: randBuf(nKvDim * nEmbd),      # GQA: K is [nKvDim, nEmbd]
+      wv: randBuf(nKvDim * nEmbd),      # GQA: V is [nKvDim, nEmbd]
       wo: randBuf(nEmbd * nEmbd, resStd),
       fcGate: randBuf(ffnMul * nEmbd * nEmbd),
       fcUp: randBuf(ffnMul * nEmbd * nEmbd),
@@ -88,8 +94,8 @@ proc initModel(vocabSize: int): Model =
       ln1g: onesBuf(nEmbd),
       ln2g: onesBuf(nEmbd),
       dwq: gpuCreate(nEmbd * nEmbd),
-      dwk: gpuCreate(nEmbd * nEmbd),
-      dwv: gpuCreate(nEmbd * nEmbd),
+      dwk: gpuCreate(nKvDim * nEmbd),
+      dwv: gpuCreate(nKvDim * nEmbd),
       dwo: gpuCreate(nEmbd * nEmbd),
       dfcGate: gpuCreate(ffnMul * nEmbd * nEmbd),
       dfcUp: gpuCreate(ffnMul * nEmbd * nEmbd),
@@ -114,9 +120,9 @@ proc initModel(vocabSize: int): Model =
   result.ropeCos = toGpu(cosTab)
   result.ropeSin = toGpu(sinTab)
 
-  # SwiGLU has 3 FFN matrices (gate, up, down) instead of 2 (fc1, fc2). No wpe.
+  # GQA: wq [n,n] + wk [kvd,n] + wv [kvd,n] + wo [n,n] + 3 SwiGLU FFN
   let total = vocabSize * nEmbd * 2 +
-    nLayer * (4 * nEmbd * nEmbd + 3 * ffnMul * nEmbd * nEmbd)
+    nLayer * (2 * nEmbd * nEmbd + 2 * nKvDim * nEmbd + 3 * ffnMul * nEmbd * nEmbd)
   echo &"  params: {total}"
 
 # ── Saved intermediates for backward ──────────────────────────────
@@ -170,19 +176,19 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     lc.rms1 = trackedCreate(S)
     gpu_rmsnorm_affine_fwd(x.data, layer.ln1g.data, lc.xNorm1.data, lc.rms1.data, cint(S), cint(n))
 
-    # Q, K, V projections
+    # Q, K, V projections (GQA: K and V have fewer heads)
     lc.q = trackedCreate(S * n)
-    lc.k = trackedCreate(S * n)
-    lc.v = trackedCreate(S * n)
+    lc.k = trackedCreate(S * nKvDim)
+    lc.v = trackedCreate(S * nKvDim)
     gpuSgemm(2, S, n, n, lc.xNorm1, layer.wq, lc.q)
-    gpuSgemm(2, S, n, n, lc.xNorm1, layer.wk, lc.k)
-    gpuSgemm(2, S, n, n, lc.xNorm1, layer.wv, lc.v)
+    gpuSgemm(2, S, nKvDim, n, lc.xNorm1, layer.wk, lc.k)
+    gpuSgemm(2, S, nKvDim, n, lc.xNorm1, layer.wv, lc.v)
 
-    # RoPE: rotate Q and K by position (replaces learned positional embedding)
+    # RoPE: rotate Q and K by position
     ropeFwd(lc.q, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
-    ropeFwd(lc.k, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
+    ropeFwd(lc.k, m.ropeCos, m.ropeSin, S, nKvDim, nKvHead, headDim)
 
-    # Multi-head attention via cuBLAS — fast matmuls + custom softmax/mask.
+    # GQA attention: each KV head serves kvRepeat Q heads
     let scale = 1.0f / sqrt(float32(headDim))
     lc.attnOut = trackedCreate(S * n)
 
@@ -196,8 +202,12 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
 
     for h in 0 ..< nHead:
       extractHead(lc.q, qH, h, S, n, headDim)
-      extractHead(lc.k, kH, h, S, n, headDim)
-      extractHead(lc.v, vH, h, S, n, headDim)
+      # GQA: map Q head h to KV head h div kvRepeat
+      let kvH = h div kvRepeat
+      gpu_extract_kv_head(lc.k.data, kH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
+      gpu_extract_kv_head(lc.v.data, vH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
 
       # scores = Q_h @ K_h^T  [S,hd] × [hd,S] → [S,S]
       gpuSgemm(2, S, S, headDim, qH, kH, scores)
@@ -342,11 +352,10 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
     gpuSgemm(1, S, n, n, dx, layer.wo, dAttnOut)
     gpuSgemm(5, n, n, S, dx, lc.attnOut, m.layers[li].dwo)
 
-    # Multi-head attention backward via cuBLAS
-    # Recompute attention weights, then compute dQ, dK, dV with matmuls
+    # GQA attention backward via cuBLAS
     let dq = trackedCreate(S * n)
-    let dk = trackedCreate(S * n)
-    let dv = trackedCreate(S * n)
+    let dk = trackedCreate(S * nKvDim)
+    let dv = trackedCreate(S * nKvDim)
     let scale = 1.0f / sqrt(float32(headDim))
 
     let doutH = trackedCreate(S * headDim)
@@ -365,52 +374,50 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
     for h in 0 ..< nHead:
       extractHead(dAttnOut, doutH, h, S, n, headDim)
       extractHead(lc.q, qH, h, S, n, headDim)
-      extractHead(lc.k, kH, h, S, n, headDim)
-      extractHead(lc.v, vH, h, S, n, headDim)
+      gpu_extract_kv_head(lc.k.data, kH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
+      gpu_extract_kv_head(lc.v.data, vH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
 
       # Recompute attention weights
       gpuSgemm(2, S, S, headDim, qH, kH, bwdScores)
       causalMask(bwdScores, scale, S)
       softmaxFwd(bwdScores, bwdProbs, S, S)
 
-      # dWeights = doutH @ vH^T  [S,hd] × [hd,S] → [S,S]
       gpuSgemm(2, S, S, headDim, doutH, vH, dWeights)
-      # dV = probs^T @ doutH  [S,S]^T × [S,hd] → [S,hd]
       gpuSgemm(4, S, headDim, S, bwdProbs, doutH, dvH)
 
-      # Softmax backward: dScores = probs * (dWeights - row_dot)
-      # Zero dScores — softmax_bwd kernel accumulates (+=)
       discard cudaMemset(dScores.data, 0, csize_t(S * S * sizeof(float32)))
       softmaxBwd(bwdProbs, dWeights, dScores, S, S)
-      # Chain rule: multiply by scale (from causalMask's scaling)
       gpu_scale(dScores.data, scale, dScores.data, cint(S * S))
 
-      # dQ = dScores @ K  [S,S] × [S,hd] → [S,hd]
       gpuSgemm(0, S, headDim, S, dScores, kH, dqH)
-      # dK = dScores^T @ Q  [S,S]^T × [S,hd] → [S,hd]
       gpuSgemm(4, S, headDim, S, dScores, qH, dkH)
 
       insertHeadAcc(dqH, dq, h, S, n, headDim)
-      insertHeadAcc(dkH, dk, h, S, n, headDim)
-      insertHeadAcc(dvH, dv, h, S, n, headDim)
+      # GQA: accumulate dK/dV back to the shared KV head
+      gpu_insert_kv_head_acc(dkH.data, dk.data, cint(h), cint(kvRepeat),
+                             cint(S), cint(nKvDim), cint(headDim))
+      gpu_insert_kv_head_acc(dvH.data, dv.data, cint(h), cint(kvRepeat),
+                             cint(S), cint(nKvDim), cint(headDim))
 
-    # Inverse RoPE on dQ and dK before QKV weight backward
+    # Inverse RoPE before weight backward
     ropeBwd(dq, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
-    ropeBwd(dk, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
+    ropeBwd(dk, m.ropeCos, m.ropeSin, S, nKvDim, nKvHead, headDim)
 
-    # QKV projection backward
+    # QKV projection backward (K/V use smaller nKvDim)
     let dNorm1 = trackedCreate(S * n)
     gpuSgemm(1, S, n, n, dq, layer.wq, dNorm1)
     gpuSgemm(5, n, n, S, dq, lc.xNorm1, m.layers[li].dwq)
 
     let dNorm1k = trackedCreate(S * n)
-    gpuSgemm(1, S, n, n, dk, layer.wk, dNorm1k)
-    gpuSgemm(5, n, n, S, dk, lc.xNorm1, m.layers[li].dwk)
+    gpuSgemm(1, S, n, nKvDim, dk, layer.wk, dNorm1k)
+    gpuSgemm(5, nKvDim, n, S, dk, lc.xNorm1, m.layers[li].dwk)
     gpu_add_inplace(dNorm1.data, dNorm1k.data, cint(S * n))
 
     let dNorm1v = trackedCreate(S * n)
-    gpuSgemm(1, S, n, n, dv, layer.wv, dNorm1v)
-    gpuSgemm(5, n, n, S, dv, lc.xNorm1, m.layers[li].dwv)
+    gpuSgemm(1, S, n, nKvDim, dv, layer.wv, dNorm1v)
+    gpuSgemm(5, nKvDim, n, S, dv, lc.xNorm1, m.layers[li].dwv)
     gpu_add_inplace(dNorm1.data, dNorm1v.data, cint(S * n))
 
     # RMSNorm 1 backward
@@ -788,13 +795,14 @@ when isMainModule:
   let S = blockSize  # max sequence length
   let n = nEmbd
   let V = tok.vocab.len
-  let fwdPerLayer = 10 * S * n + 4 * S * headDim + 2 * S + 2 * S * ffnMul * n + 2 * S * S
-  let fwdGlobal = 3 * S * n + S + 2 * S * n + S + 2 * S * V
-  let bwdPerLayer = 10 * S * n + 7 * S * headDim + 2 * S * ffnMul * n + 4 * S * S
+  # SwiGLU: 3 FFN buffers in forward (gate, up, swiglu out), 4 in backward (+dGate, +dUp, +dNorm2up)
+  let fwdPerLayer = 10 * S * n + 4 * S * headDim + 2 * S + 3 * S * ffnMul * n + 2 * S * S
+  let fwdGlobal = S * n + S + 2 * S * V
+  let bwdPerLayer = 11 * S * n + 7 * S * headDim + 3 * S * ffnMul * n + 4 * S * S
   let bwdGlobal = S * V + 2 * S * n
   let arenaSize = fwdGlobal + fwdPerLayer * nLayer + bwdGlobal + bwdPerLayer * nLayer
   let arenaMB = arenaSize * sizeof(float32) div (1024 * 1024)
-  initScratchArena(arenaSize + arenaSize div 10)  # +10% headroom
+  initScratchArena(arenaSize + arenaSize div 4)  # +25% headroom
   echo &"  scratch arena: {arenaMB} MB ({arenaSize} floats)"
 
   # Train

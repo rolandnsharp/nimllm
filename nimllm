@@ -49,6 +49,10 @@ case "${1:-help}" in
     echo "rebuilding training_data.txt from all sources..."
     python3 "$DIR/build_data.py"
     ;;
+  distill)
+    shift
+    python3 "$DIR/distill.py" "$@"
+    ;;
   build)
     echo "compiling CUDA kernels..."
     cd "$SRC" && nvcc -c -O2 -Xcompiler -fPIC -o kernels.o kernels.cu
