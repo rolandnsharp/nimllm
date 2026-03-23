@@ -275,12 +275,16 @@ proc generate(m: Model, tok: Tokenizer, prompt: string,
     freeStepAllocations()
     let tokenId = sample(logits)
 
+    let tokenStr = tok.vocab[tokenId]
+
+    # Stop on any token that contains a special marker
     if tokenId == tok.bosId or tokenId == tok.userId or
-       tokenId == tok.assistantId:
+       tokenId == tok.assistantId or
+       "<|user|>" in tokenStr or "<|assistant|>" in tokenStr or
+       "<|bos|>" in tokenStr:
       break
 
     history.add(int32(tokenId))
-    let tokenStr = tok.vocab[tokenId]
     response.add(tokenStr)
 
   response
