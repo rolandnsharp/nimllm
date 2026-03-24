@@ -62,9 +62,10 @@ type
     geluOut*: GpuBuf
 
   # KV cache for fast inference (don't recompute full sequence every token)
+  # Stored per-head for zero-copy head access: [nLayer][nKvHead] each [blockSize, headDim]
   KvCache* = object
-    k*: seq[GpuBuf]       # [nLayer] each [blockSize, nKvDim] — accumulated K values
-    v*: seq[GpuBuf]       # [nLayer] each [blockSize, nKvDim] — accumulated V values
+    k*: seq[seq[GpuBuf]]  # [nLayer][nKvHead] each [blockSize, headDim]
+    v*: seq[seq[GpuBuf]]  # [nLayer][nKvHead] each [blockSize, headDim]
     pos*: int             # current position (number of tokens processed)
 
   ForwardCache* = object
@@ -490,16 +491,22 @@ proc zeroGrads*(m: var Model) =
 # ── KV Cache for fast inference ───────────────────────────────────
 
 proc initKvCache*(): KvCache =
-  ## Pre-allocate KV cache for all layers.
-  for i in 0 ..< nLayer:
-    result.k.add(gpuCreate(blockSize * nKvDim))
-    result.v.add(gpuCreate(blockSize * nKvDim))
+  ## Pre-allocate KV cache: [nLayer][nKvHead] each [blockSize, headDim]
+  for li in 0 ..< nLayer:
+    var kHeads: seq[GpuBuf]
+    var vHeads: seq[GpuBuf]
+    for h in 0 ..< nKvHead:
+      kHeads.add(gpuCreate(blockSize * headDim))
+      vHeads.add(gpuCreate(blockSize * headDim))
+    result.k.add(kHeads)
+    result.v.add(vHeads)
   result.pos = 0
 
 proc resetKvCache*(kv: var KvCache) =
-  for i in 0 ..< nLayer:
-    gpuZero(kv.k[i])
-    gpuZero(kv.v[i])
+  for li in 0 ..< nLayer:
+    for h in 0 ..< nKvHead:
+      gpuZero(kv.k[li][h])
+      gpuZero(kv.v[li][h])
   kv.pos = 0
 
 proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32] =
@@ -552,54 +559,48 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
     ropeFwd(q, ropeCosOff, ropeSinOff, newTokens, n, nHead, headDim)
     ropeFwd(kNew, ropeCosOff, ropeSinOff, newTokens, nKvDim, nKvHead, headDim)
 
-    # Append new K/V to cache
-    # kv.k[li] is [blockSize, nKvDim], we write at row kv.pos
-    let kDst = cast[pointer](cast[int](kv.k[li].data) + kv.pos * nKvDim * sizeof(float32))
-    let vDst = cast[pointer](cast[int](kv.v[li].data) + kv.pos * nKvDim * sizeof(float32))
-    discard cudaMemcpy(kDst, kNew.data,
-                       csize_t(newTokens * nKvDim * sizeof(float32)),
-                       CudaMemcpyDeviceToDevice)
-    discard cudaMemcpy(vDst, vNew.data,
-                       csize_t(newTokens * nKvDim * sizeof(float32)),
-                       CudaMemcpyDeviceToDevice)
+    # Append new K/V to per-head cache buffers
+    # kNew is [newTokens, nKvDim] — split into nKvHead heads of [newTokens, headDim]
+    for kvh in 0 ..< nKvHead:
+      let srcK = cast[pointer](cast[int](kNew.data) + kvh * headDim * sizeof(float32))
+      let srcV = cast[pointer](cast[int](vNew.data) + kvh * headDim * sizeof(float32))
+      let dstK = cast[pointer](cast[int](kv.k[li][kvh].data) + kv.pos * headDim * sizeof(float32))
+      let dstV = cast[pointer](cast[int](kv.v[li][kvh].data) + kv.pos * headDim * sizeof(float32))
+      # For newTokens=1 and contiguous headDim, direct copy works
+      if newTokens == 1:
+        discard cudaMemcpy(dstK, srcK, csize_t(headDim * sizeof(float32)), CudaMemcpyDeviceToDevice)
+        discard cudaMemcpy(dstV, srcV, csize_t(headDim * sizeof(float32)), CudaMemcpyDeviceToDevice)
+      else:
+        # Multi-token: need to extract per-head from interleaved layout
+        gpu_extract_kv_head(kNew.data, dstK, cint(kvh * kvRepeat), cint(kvRepeat),
+                            cint(newTokens), cint(nKvDim), cint(headDim))
+        gpu_extract_kv_head(vNew.data, dstV, cint(kvh * kvRepeat), cint(kvRepeat),
+                            cint(newTokens), cint(nKvDim), cint(headDim))
 
-    # Attention: Q_new × K_all^T → scores [newTokens, S]
-    # K_all is kv.k[li][0:S, nKvDim]
-    let qH = trackedCreate(newTokens * headDim)
-    let kH = trackedCreate(S * headDim)
-    let vH = trackedCreate(S * headDim)
-    let attnH = trackedCreate(newTokens * headDim)
+    # Attention with per-head KV cache — no extract/insert kernels needed
     let scores = trackedCreate(newTokens * S)
     let probs = trackedCreate(newTokens * S)
-
     let attnOut = trackedCreate(newTokens * n)
-    for h in 0 ..< nHead:
-      # Extract Q head from new tokens [newTokens, headDim]
-      extractHead(q, qH, h, newTokens, n, headDim)
-      # Extract K/V heads from FULL cache [S, headDim]
-      gpu_extract_kv_head(kv.k[li].data, kH.data, cint(h), cint(kvRepeat),
-                          cint(S), cint(nKvDim), cint(headDim))
-      gpu_extract_kv_head(kv.v[li].data, vH.data, cint(h), cint(kvRepeat),
-                          cint(S), cint(nKvDim), cint(headDim))
 
-      # scores = Q_new @ K_all^T  [newTokens, headDim] × [headDim, S] → [newTokens, S]
+    for h in 0 ..< nHead:
+      let kvh = h div kvRepeat
+      # Q head: pointer offset into q[1, nEmbd] at h*headDim
+      let qPtr = cast[pointer](cast[int](q.data) + h * headDim * sizeof(float32))
+      var qH = GpuBuf(data: qPtr, numel: newTokens * headDim)
+      # K/V: direct from per-head cache [S, headDim] — zero copy!
+      var kH = GpuBuf(data: kv.k[li][kvh].data, numel: S * headDim)
+      var vH = GpuBuf(data: kv.v[li][kvh].data, numel: S * headDim)
+      # Attention output: pointer offset into attnOut
+      let outPtr = cast[pointer](cast[int](attnOut.data) + h * headDim * sizeof(float32))
+      var attnH = GpuBuf(data: outPtr, numel: newTokens * headDim)
+
       gpuSgemm(2, newTokens, S, headDim, qH, kH, scores)
-      # Causal mask: position i (absolute: kv.pos+i) can attend to positions 0..kv.pos+i
-      # For the score matrix [newTokens, S], entry [i, j] should be masked if j > kv.pos+i
-      # Simple approach: use full causal mask on the [newTokens, S] matrix with offset
-      # For now, no mask needed if newTokens=1 (single token generation)
-      # For prompt processing (newTokens > 1), we need proper masking
       if newTokens == 1:
-        # Single token: attends to all S positions, no masking needed
         gpu_scale(scores.data, scale, scores.data, cint(S))
       else:
-        # Multi-token: need offset causal mask (TODO: proper implementation)
         causalMask(scores, scale, S)
-
       softmaxFwd(scores, probs, newTokens, S)
-      # output = probs @ V_all  [newTokens, S] × [S, headDim] → [newTokens, headDim]
       gpuSgemm(0, newTokens, headDim, S, probs, vH, attnH)
-      insertHead(attnH, attnOut, h, newTokens, n, headDim)
 
     # Output projection + residual
     let projected = trackedCreate(newTokens * n)

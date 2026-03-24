@@ -75,6 +75,32 @@ proc cublasSgemmStridedBatched*(handle: CublasHandle,
     batchCount: cint): CublasStatus
   {.importc: "cublasSgemmStridedBatched", header: "<cublas_v2.h>".}
 
+# ── CUDA Graphs ──────────────────────────────────────────────────
+
+type
+  CudaStream* = pointer
+  CudaGraph* = pointer
+  CudaGraphExec* = pointer
+
+proc cudaStreamCreate*(stream: ptr CudaStream): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+proc cudaStreamBeginCapture*(stream: CudaStream, mode: cint): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+proc cudaStreamEndCapture*(stream: CudaStream, graph: ptr CudaGraph): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+proc cudaGraphInstantiate*(graphExec: ptr CudaGraphExec, graph: CudaGraph,
+    errNode: pointer, errBuf: pointer, bufSize: csize_t): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+proc cudaGraphLaunch*(graphExec: CudaGraphExec, stream: CudaStream): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+proc cudaStreamSynchronize*(stream: CudaStream): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+
+const cudaStreamCaptureModeGlobal* = 0.cint
+
+proc cublasSetStream*(handle: CublasHandle, stream: CudaStream): CublasStatus
+  {.importc: "cublasSetStream_v2", header: "<cublas_v2.h>".}
+
 # ── cuRAND ────────────────────────────────────────────────────────
 
 proc curandCreateGenerator*(gen: ptr CurandGenerator, rngType: cint): cint
