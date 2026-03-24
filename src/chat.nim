@@ -58,23 +58,30 @@ var gKv: KvCache  # global KV cache, persists across turns
 
 proc generate(m: Model, tok: Tokenizer, prompt: string,
               history: var seq[int32], maxTokens: int = 200): string =
-  # Format prompt
-  let hasImTokens = tok.tokenToId.getOrDefault("<|im_start|>", -1) >= 0
-  let imStart = if hasImTokens: "<|im_start|>" else: ""
-  let imEnd = if hasImTokens: "<|im_end|>" else: ""
-  let chatPrompt = if imStart.len > 0:
-      (if history.len == 0: imStart & "system\nYou are a helpful assistant." & imEnd & "\n" else: "") &
-      imStart & "user\n" & prompt & imEnd & "\n" & imStart & "assistant\n"
+  # Format prompt — detect chat format from tokenizer
+  let hasLlama = tok.tokenToId.getOrDefault("<|start_header_id|>", -1) >= 0
+  let hasIm = tok.tokenToId.getOrDefault("<|im_start|>", -1) >= 0
+  let chatPrompt = if hasLlama:
+      # LLaMA 3 format
+      (if history.len == 0: "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>" else: "") &
+      "<|start_header_id|>user<|end_header_id|>\n\n" & prompt & "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    elif hasIm:
+      # ChatML format (SmolLM, Qwen)
+      (if history.len == 0: "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n" else: "") &
+      "<|im_start|>user\n" & prompt & "<|im_end|>\n<|im_start|>assistant\n"
     else:
+      # nimllm native format
       "<|user|> " & prompt & " <|assistant|> "
   let inputTokens = tok.encode(chatPrompt)
   for id in inputTokens:
     history.add(int32(id))
 
-  # Stop tokens
+  # Stop tokens — support all formats
   let eosId = tok.tokenToId.getOrDefault("<|endoftext|>", -1)
   let imStartId = tok.tokenToId.getOrDefault("<|im_start|>", -1)
   let imEndId = tok.tokenToId.getOrDefault("<|im_end|>", -1)
+  let eotId = tok.tokenToId.getOrDefault("<|eot_id|>", -1)
+  let endTextId = tok.tokenToId.getOrDefault("<|end_of_text|>", -1)
 
   # Init or reset KV cache if near full
   if gKv.k.len == 0:
@@ -100,7 +107,8 @@ proc generate(m: Model, tok: Tokenizer, prompt: string,
 
     if tokenId == tok.bosId or tokenId == tok.userId or
        tokenId == tok.assistantId or
-       tokenId == eosId or tokenId == imStartId or tokenId == imEndId:
+       tokenId == eosId or tokenId == imStartId or tokenId == imEndId or
+       tokenId == eotId or tokenId == endTextId:
       break
 
     history.add(int32(tokenId))

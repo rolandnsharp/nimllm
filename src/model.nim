@@ -10,16 +10,17 @@ import std/[math, random, streams, strformat, tables]
 # ── Configuration ─────────────────────────────────────────────────
 
 const
-  nLayer*   = 30
-  nEmbd*    = 576
-  nHead*    = 9
-  nKvHead*  = 3
+  nLayer*   = 16
+  nEmbd*    = 2048
+  nHead*    = 32
+  nKvHead*  = 8
   headDim*  = nEmbd div nHead  # 64
-  kvRepeat* = nHead div nKvHead  # 3
-  nKvDim*   = nKvHead * headDim  # 192
+  kvRepeat* = nHead div nKvHead  # 4
+  nKvDim*   = nKvHead * headDim  # 512
   blockSize* = 512
-  ffnDim*   = 1536
-  ropeTheta* = 100000.0f
+  ffnDim*   = 8192
+  ropeTheta* = 500000.0f
+  frozenLayers* = 12     # freeze bottom layers for fine-tuning (0 = train all)
 
 # ── Types ─────────────────────────────────────────────────────────
 
@@ -364,6 +365,9 @@ proc backward*(m: var Model, tokens: seq[int32], seqLen: int,
 
   # Backward through layers in reverse
   for li in countdown(nLayer - 1, 0):
+    # Skip frozen layers — no gradients needed
+    if li < frozenLayers:
+      break
     let lc = cache.layerCaches[li]
     let layer = m.layers[li]
 
