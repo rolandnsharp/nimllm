@@ -72,11 +72,11 @@ proc generate(m: Model, tok: Tokenizer, prompt: string,
   if gKv.k.len == 0:
     gKv = initKvCache()
 
-  # Process prompt tokens through KV cache (all at once)
-  var promptIds = newSeq[int32](inputTokens.len)
-  for i, id in inputTokens: promptIds[i] = int32(id)
-  var logits = forwardCached(m, gKv, promptIds)
-  freeStepAllocations()
+  # Process prompt tokens through KV cache (one at a time for correct causal masking)
+  var logits: seq[float32]
+  for id in inputTokens:
+    logits = forwardCached(m, gKv, @[int32(id)])
+    freeStepAllocations()
 
   # Generate tokens one at a time
   var response = ""
