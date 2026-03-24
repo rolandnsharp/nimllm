@@ -1,170 +1,137 @@
 # nimllm
 
-A grockable language model. No black boxes except the matrix multiplier.
+LLaMA in Nim. Readable. Trainable. Growable.
 
-One binary. Trains on your data. Chats with you. Reads books. Grows.
-Runs entirely on your GPU. You own every line of code and every weight.
+Like llama.cpp but you can read it like Python, train it on your books,
+and grow it over time. Inference and training in one codebase — the model
+learns from every interaction.
 
-## Quick Start
+## What It Is
 
-```bash
-# Build
-nimllm build
-
-# First training run (cosine LR schedule with warmup)
-nimllm train
-
-# Chat
-nimllm chat
-
-# Single prompt (non-interactive)
-nimllm prompt "what is the meaning of life?"
-```
-
-## The Growth Loop
-
-nimllm is not a one-shot training run. It's a living process.
+A complete LLM implementation in ~2000 lines of Nim + CUDA. No PyTorch,
+no frameworks, no dependencies beyond the CUDA toolkit. Loads pre-trained
+weights from HuggingFace (SmolLM, LLaMA, Mistral, Qwen — anything
+LLaMA-compatible). Trains on your data. Grows when you need more capacity.
 
 ```bash
-# 1. Train from scratch on your data
-nimllm train
-
-# 2. Test it
-nimllm chat
-
-# 3. Add better data (books, distilled Q&A, curriculum)
-nimllm data
-
-# 4. Continue training from checkpoint (constant low LR, no disruption)
-nimllm continue
-
-# 5. Test again — it's better now
-nimllm chat
-
-# 6. Repeat forever
+nimllm chat                        # talk to it
+nimllm prompt "what is Forth?"     # one-shot question
+nimllm continue                    # keep training on new data
+nimllm read meditations.txt        # absorb a book without forgetting
+nimllm grow old_model.bin          # expand to bigger dimensions
+nimllm build                       # compile from source
 ```
 
-Each pass the model gets better. Each pass the data gets better. They co-evolve.
+## Why Not llama.cpp?
 
-## Commands
+llama.cpp is an inference engine — it loads frozen weights and generates
+text. It cannot learn. It cannot grow. It cannot absorb a book you give it.
 
-```
-nimllm train              First run: full cosine LR schedule with warmup
-nimllm continue           Every run after: constant low LR, refines from checkpoint
-nimllm chat               Interactive conversation
-nimllm prompt "..."       Single question, prints answer, exits
-nimllm read <file>        Absorb a text file (elastic pull prevents forgetting)
-nimllm grow <checkpoint>  Expand model from smaller checkpoint
-nimllm data               Rebuild training_data.txt from all sources
-nimllm feed               Feed all books sequentially
-nimllm build              Compile CUDA kernels + Nim binaries
-nimllm status             Show model info and training status
-nimllm distill            Generate synthetic Q&A from teacher model via Ollama
-```
+nimllm's weights are alive. Every conversation, every book, every training
+pass changes them. The model accumulates knowledge over time like a mind
+accumulates experience. Inference and training are not separate programs —
+they share the same forward pass because learning IS inference plus feedback.
 
 ## Architecture
 
-91M parameters. LLaMA-compatible architecture:
+LLaMA-compatible transformer. Same ideas as LLaMA, Mistral, Qwen:
 
-- **12 layers, 768 dim, 12 query heads, 4 KV heads (GQA)**
-- **RoPE** positional encoding (no learned position embeddings)
+- **RoPE** positional encoding
 - **RMSNorm** (not LayerNorm)
 - **SwiGLU** activation (not GELU)
-- **cuBLAS attention** — fast matmuls for QK^T and probs@V
-- **BPE tokenizer** (4259 vocab, trained on your data, atomic special tokens)
+- **GQA** grouped query attention
+- **cuBLAS** matmuls for attention
 
-Same ideas as LLaMA, Mistral, Qwen — but from scratch in ~1000 lines of Nim.
+Currently running SmolLM2-135M (30 layers, 576 dim, 9 heads, 3 KV heads).
+Can load any model with this architecture by changing 6 constants.
+
+## Code Structure
 
 ```
-src/microgpt.nim  — training: forward, backward, Adam, checkpoint save/load
-src/chat.nim      — interactive generation with sampling
-src/gpu.nim       — CUDA bindings: cuBLAS, memory, kernel declarations
-src/kernels.cu    — CUDA kernels: softmax, SwiGLU, RMSNorm, RoPE, GQA, etc.
-src/bpe.nim       — byte pair encoding tokenizer
-src/autograd.nim  — scratch arena allocator
+src/model.nim      shared: types, init, forward pass, save/load
+src/chat.nim       inference: sampling, generation, chat loop
+src/microgpt.nim   training: backward pass, optimizer, training loop
+src/gpu.nim        CUDA bindings: cuBLAS, memory, kernel declarations
+src/kernels.cu     GPU kernels: softmax, SwiGLU, RMSNorm, RoPE, GQA
+src/bpe.nim        tokenizer: BPE + greedy longest-match for pre-trained vocabs
+src/autograd.nim   scratch arena allocator
 ```
 
-## How It Works
+The forward pass lives in `model.nim` and is shared by both inference and
+training. No code duplication. Change the architecture once, both paths
+update.
 
-**Forward pass:** Token embedding → 12 transformer layers (RMSNorm → QKV
-projection → RoPE → GQA cuBLAS attention → output projection → RMSNorm →
-SwiGLU FFN) → final norm → logits → log-softmax → loss.
+## The Growth Loop
 
-**Backward pass:** Explicit reverse. No autograd graph, no closures, no
-topological sort. Each operation saves what backward needs. Backward runs
-in reverse order. You can read it top to bottom.
+```
+1. Load pre-trained weights (SmolLM, LLaMA, etc.)
+2. Chat — test what it knows
+3. Feed it data (books, Q&A, your conversations)
+4. nimllm continue — train on the new data
+5. Chat — it's better now
+6. Repeat
+7. When capacity maxes out: nimllm grow → bigger model, preserved knowledge
+```
 
-**Attention:** cuBLAS matmuls for QK^T and probs@V. Custom kernels for
-softmax and causal masking. Grouped Query Attention — 4 KV heads serve
-12 query heads.
+## Memory Through Training
 
-**Memory management:** Scratch arena — one big GPU allocation at startup,
-bump-allocated per step, zeroed on reset. Zero cudaMalloc calls in the
-hot loop.
+The core idea: instead of a context window that forgets, nimllm moves
+knowledge into weights. Read a book → weights change permanently.
+Have a conversation → the important parts get trained into the model.
+Context is temporary. Weights are memory.
 
-## Growing the Model
+`nimllm read` uses elastic weight consolidation — current weights are
+saved as an anchor, and during training the model is gently pulled back
+toward the anchor. New knowledge is absorbed without destroying old knowledge.
 
-nimllm is designed to grow incrementally:
+## Loading Pre-Trained Models
 
-1. Train at current size until loss plateaus
-2. Bump dimensions/layers in the config constants
-3. `nimllm grow nimllm.bin` — loads old weights into the bigger model
-4. `nimllm continue` — old knowledge preserved, new capacity learns
-
-## Absorbing Books
+nimllm can load any LLaMA-compatible model from HuggingFace:
 
 ```bash
-nimllm read ~/data/books/meditations.txt
-```
+# Download model
+python3 -c "from huggingface_hub import snapshot_download; \
+  snapshot_download('HuggingFaceTB/SmolLM2-135M-Instruct', \
+  local_dir='models/smollm2')"
 
-Elastic weight consolidation saves current weights as an anchor before
-reading. After each optimizer step, weights are pulled 0.1% back toward
-the anchor. The model absorbs new knowledge without forgetting what it
-already knows.
+# Convert to nimllm format
+python3 load_hf.py models/smollm2 nimllm.bin
 
-## Distillation
+# Convert tokenizer
+python3 -c "..."  # (see TODO for tokenizer conversion script)
 
-Generate high-quality synthetic training data from a teacher model:
-
-```bash
-nimllm distill --teacher qwen3.5:9b --mode qa --max-docs 5000
-nimllm data       # rebuild training set with distilled data included
-nimllm continue   # train on enriched data
+# Chat
+nimllm chat
 ```
 
 ## Training Data
 
-nimllm trains on everything mixed together:
+Pre-tokenize once (fast), train many times:
 
-- **Chat conversations** — teaches dialogue
-- **207 books from Project Gutenberg** — philosophy, literature, science
-- **Curriculum** — Karpathy's blogs, Nim manual, transformer science,
-  Thinking in Forth, history of backpropagation, the Book of nimllm
-- **Distilled Q&A** — synthetic data from Qwen3.5 teacher
-- **Claude Code logs** — real programming conversations
+```bash
+python3 pretokenize.py              # 49M tokens → binary in 91 seconds
+nimllm train                        # loads binary in 1.4 seconds
+```
 
-All shuffled. The model learns all domains simultaneously. No catastrophic
-forgetting because it never stops seeing any domain.
-
-## Self-Knowledge
-
-nimllm trains on its own source code and a document called the Book of
-nimllm that describes what it is, how it works, who built the ideas it
-uses, and why it exists. The model knows itself.
+The training set includes:
+- Chat conversations (dialogue patterns)
+- 207 books from Project Gutenberg (language depth)
+- Curriculum: Q&A, philosophy, science, history, Forth, Nim (knowledge)
+- Distilled data from Qwen3.5 (reasoning quality)
+- The Book of nimllm (self-knowledge)
 
 ## Hardware
 
-Designed for NVIDIA GPUs with 8-12GB VRAM. Tested on RTX 3060 12GB.
-
-| Model Size | Dim  | Layers | Q Heads | KV Heads | Speed      |
-|-----------|------|--------|---------|----------|------------|
-| 91M       | 768  | 12     | 12      | 4        | 13.5 opt/s |
+NVIDIA GPU with 8-12GB VRAM. Tested on RTX 3060 12GB.
+Inference: any model that fits in VRAM.
+Training: models up to ~200M params at full precision.
 
 ## Inspired By
 
-- Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT)
-- The LLaMA architecture (RoPE, RMSNorm, SwiGLU, GQA)
-- The Phi papers (quality data beats quantity)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) — inference engine we're extending with training
+- [nanoGPT](https://github.com/karpathy/nanoGPT) — the seed: one-file GPT you can understand
+- [llm.c](https://github.com/karpathy/llm.c) — pre-tokenization, speed, C-level simplicity
+- The LLaMA architecture — RoPE, RMSNorm, SwiGLU, GQA
 - Alan Turing: "produce a programme which simulates the child's mind,
   then subject it to an appropriate course of education"
 
