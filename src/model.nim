@@ -322,26 +322,95 @@ proc loadModelGguf*(m: var Model, ggufPath: string) =
   # Final norm (F32)
   uploadF32("output_norm.weight", m.lnFg)
 
-  # Layers: load Q8_0 weight matrices directly (no dequant)
+  proc dequantQ8toNewBuf(name: string, numel: int, unpermute: bool = false, heads: int = 0): GpuBuf =
+    ## Load Q8_0, dequant to float32, upload to new GpuBuf
+    result = gpuCreate(numel)
+    # Reuse the existing dequant logic but with unpermute support
+    var raw = gf.loadTensorRaw(name)
+    if raw.len == 0: return
+
+    if unpermute and heads > 0:
+      let t = gf.tensors[name]
+      let cols = t.dims[0].int
+      let rows = t.dims[1].int
+      let bytesPerRow = (cols div 32) * 34
+      let hd = rows div heads
+      var permuted = newSeq[uint8](raw.len)
+      for h in 0 ..< heads:
+        for i in 0 ..< hd div 2:
+          let srcRow0 = h * hd + 2 * i
+          let srcRow1 = h * hd + 2 * i + 1
+          let dstRow0 = h * hd + i
+          let dstRow1 = h * hd + hd div 2 + i
+          copyMem(addr permuted[dstRow0 * bytesPerRow], addr raw[srcRow0 * bytesPerRow], bytesPerRow)
+          copyMem(addr permuted[dstRow1 * bytesPerRow], addr raw[srcRow1 * bytesPerRow], bytesPerRow)
+      raw = permuted
+
+    let nBlocks = raw.len div 34
+    var f32 = newSeq[float32](nBlocks * 32)
+    var pos = 0
+    for b in 0 ..< nBlocks:
+      let base = b * 34
+      let scale = f16toF32(raw[base], raw[base + 1])
+      for i in 0 ..< 32:
+        let v = cast[int8](raw[base + 2 + i])
+        f32[pos] = scale * float32(v)
+        pos += 1
+    gpuUpload(result, f32)
+
+  # Layers: frozen layers get Q8_0, trainable layers get float32 + gradients
+  let trainable = nLayer - frozenLayers
   for li in 0 ..< nLayer:
-    echo &"  layer {li+1}/{nLayer}"
+    let isFrozen = li < frozenLayers
+    let tag = if isFrozen: "Q8_0" else: "f32+grad"
+    echo &"  layer {li+1}/{nLayer} ({tag})"
     let p = &"blk.{li}"
-    # Q and K weights are permuted for ggml's RoPE — unpermute for our RoPE
-    m.layers[li].wq_q4 = uploadQ8(&"{p}.attn_q.weight", unpermute=true, heads=nHead)
-    m.layers[li].wk_q4 = uploadQ8(&"{p}.attn_k.weight", unpermute=true, heads=nKvHead)
-    m.layers[li].wv_q4 = uploadQ8(&"{p}.attn_v.weight")
-    m.layers[li].wo_q4 = uploadQ8(&"{p}.attn_output.weight")
-    m.layers[li].fcGate_q4 = uploadQ8(&"{p}.ffn_gate.weight")
-    m.layers[li].fcUp_q4 = uploadQ8(&"{p}.ffn_up.weight")
-    m.layers[li].fcDown_q4 = uploadQ8(&"{p}.ffn_down.weight")
-    # Norms (F32)
+
+    if isFrozen:
+      # Frozen: Q8_0 weights, no gradients
+      m.layers[li].wq_q4 = uploadQ8(&"{p}.attn_q.weight", unpermute=true, heads=nHead)
+      m.layers[li].wk_q4 = uploadQ8(&"{p}.attn_k.weight", unpermute=true, heads=nKvHead)
+      m.layers[li].wv_q4 = uploadQ8(&"{p}.attn_v.weight")
+      m.layers[li].wo_q4 = uploadQ8(&"{p}.attn_output.weight")
+      m.layers[li].fcGate_q4 = uploadQ8(&"{p}.ffn_gate.weight")
+      m.layers[li].fcUp_q4 = uploadQ8(&"{p}.ffn_up.weight")
+      m.layers[li].fcDown_q4 = uploadQ8(&"{p}.ffn_down.weight")
+    else:
+      # Trainable: dequant to float32 + allocate gradients
+      m.layers[li].wq = dequantQ8toNewBuf(&"{p}.attn_q.weight", nEmbd * nEmbd, unpermute=true, heads=nHead)
+      m.layers[li].wk = dequantQ8toNewBuf(&"{p}.attn_k.weight", nKvDim * nEmbd, unpermute=true, heads=nKvHead)
+      m.layers[li].wv = dequantQ8toNewBuf(&"{p}.attn_v.weight", nKvDim * nEmbd)
+      m.layers[li].wo = dequantQ8toNewBuf(&"{p}.attn_output.weight", nEmbd * nEmbd)
+      m.layers[li].fcGate = dequantQ8toNewBuf(&"{p}.ffn_gate.weight", ffnDim * nEmbd)
+      m.layers[li].fcUp = dequantQ8toNewBuf(&"{p}.ffn_up.weight", ffnDim * nEmbd)
+      m.layers[li].fcDown = dequantQ8toNewBuf(&"{p}.ffn_down.weight", nEmbd * ffnDim)
+      # Gradients
+      m.layers[li].dwq = gpuCreate(nEmbd * nEmbd)
+      m.layers[li].dwk = gpuCreate(nKvDim * nEmbd)
+      m.layers[li].dwv = gpuCreate(nKvDim * nEmbd)
+      m.layers[li].dwo = gpuCreate(nEmbd * nEmbd)
+      m.layers[li].dfcGate = gpuCreate(ffnDim * nEmbd)
+      m.layers[li].dfcUp = gpuCreate(ffnDim * nEmbd)
+      m.layers[li].dfcDown = gpuCreate(nEmbd * ffnDim)
+      m.layers[li].dln1g = gpuCreate(nEmbd)
+      m.layers[li].dln2g = gpuCreate(nEmbd)
+
+    # Norms always float32
     uploadF32(&"{p}.attn_norm.weight", m.layers[li].ln1g)
     uploadF32(&"{p}.ffn_norm.weight", m.layers[li].ln2g)
+
+  # Allocate gradient buffers for embeddings + final norm (always trainable)
+  m.dwte = gpuCreate(m.vocabSize * nEmbd)
+  m.dlmHead = gpuCreate(m.vocabSize * nEmbd)
+  m.dlnFg = gpuCreate(nEmbd)
 
   m.quantized = true
   m.quantType = 8  # Q8_0
   gQuantType = 8
-  echo "  done (GGUF Q8_0 loaded directly)"
+  let trainableParams = 2 * m.vocabSize * nEmbd + (nLayer - frozenLayers) *
+    (2 * nEmbd * nEmbd + 2 * nKvDim * nEmbd + 3 * ffnDim * nEmbd)
+  echo &"  done (GGUF: {frozenLayers} frozen Q8_0 + {nLayer - frozenLayers} trainable f32)"
+  echo &"  trainable params: {trainableParams div 1000000}M"
 
 proc quantizeQ4(buf: GpuBuf): pointer =
   ## Quantize a float32 GPU buffer to Q4_0. Returns pointer to Q4_0 data.
@@ -685,12 +754,13 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
     let q = trackedCreate(newTokens * n)
     let kNew = trackedCreate(newTokens * nKvDim)
     let vNew = trackedCreate(newTokens * nKvDim)
-    if m.quantized and newTokens == 1:
-      # Q4_0 matvec: 7x less memory bandwidth
+    if layer.wq_q4 != nil and newTokens == 1:
+      # Quantized layer: Q8_0/Q4_0 matvec
       quantMatvec(layer.wq_q4, xNorm.data, q.data, cint(n), cint(n))
       quantMatvec(layer.wk_q4, xNorm.data, kNew.data, cint(nKvDim), cint(n))
       quantMatvec(layer.wv_q4, xNorm.data, vNew.data, cint(nKvDim), cint(n))
     else:
+      # Float32 layer (trainable or multi-token)
       gpuSgemm(2, newTokens, n, n, xNorm, layer.wq, q)
       gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wk, kNew)
       gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wv, vNew)
@@ -751,7 +821,7 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
 
     # Output projection + residual
     let projected = trackedCreate(newTokens * n)
-    if m.quantized and newTokens == 1:
+    if layer.wo_q4 != nil and newTokens == 1:
       quantMatvec(layer.wo_q4, attnOut.data, projected.data, cint(n), cint(n))
     else:
       gpuSgemm(2, newTokens, n, n, attnOut, layer.wo, projected)
@@ -766,7 +836,7 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
 
     let gateOut = trackedCreate(newTokens * ffnDim)
     let upOut = trackedCreate(newTokens * ffnDim)
-    if m.quantized and newTokens == 1:
+    if layer.fcGate_q4 != nil and newTokens == 1:
       quantMatvec(layer.fcGate_q4, xNorm2.data, gateOut.data, cint(ffnDim), cint(n))
       quantMatvec(layer.fcUp_q4, xNorm2.data, upOut.data, cint(ffnDim), cint(n))
     else:
@@ -775,7 +845,7 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
     let swigluOut = trackedCreate(newTokens * ffnDim)
     gpu_swiglu_fwd(gateOut.data, upOut.data, swigluOut.data, cint(newTokens * ffnDim))
     let mlpOut = trackedCreate(newTokens * n)
-    if m.quantized and newTokens == 1:
+    if layer.fcDown_q4 != nil and newTokens == 1:
       quantMatvec(layer.fcDown_q4, swigluOut.data, mlpOut.data, cint(n), cint(ffnDim))
     else:
       gpuSgemm(2, newTokens, n, ffnDim, swigluOut, layer.fcDown, mlpOut)
