@@ -729,6 +729,7 @@ when isMainModule:
   let readFile = if readMode and paramCount() >= 2: paramStr(2) else: ""
   let growMode = paramCount() >= 1 and paramStr(1) == "--grow"
   let growFile = if growMode and paramCount() >= 2: paramStr(2) else: ""
+  let continueMode = paramCount() >= 1 and paramStr(1) == "--continue"
 
   echo "init model..."
   var m = initModel(tok.vocab.len)
@@ -809,10 +810,10 @@ when isMainModule:
   # Train
   # Read mode: ~3 passes over the material. More for short texts, fewer for long.
   let readSteps = if readMode: max(1000, min(20000, tokenizedDocs.len * 3)) else: 0
-  let numSteps = if readMode: readSteps else: 200000
-  let warmupSteps = if readMode: numSteps div 50 else: 2000
-  let peakLr = if readMode: 0.00005f else: 0.0001f
-  let minLr = if readMode: 0.000005f else: 0.00001f
+  let numSteps = if readMode: readSteps elif continueMode: 200000 else: 200000
+  let warmupSteps = if readMode: numSteps div 50 elif continueMode: 0 else: 2000
+  let peakLr = if readMode: 0.00005f elif continueMode: 0.00003f else: 0.0001f
+  let minLr = if readMode: 0.000005f elif continueMode: 0.00003f else: 0.00001f
   let gradAccum = 1      # batch 1 — research says it works with right settings
 
   # Elastic weight consolidation for --read mode.

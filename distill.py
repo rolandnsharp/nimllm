@@ -16,7 +16,7 @@ model is pulled and Ollama is running.
 
 import json, struct, os, sys, time, argparse, requests
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_URL = "http://localhost:11434/api/chat"
 TRAINING_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "training_data.txt")
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "distill_data")
 
@@ -42,57 +42,44 @@ def get_teacher_logprobs(model, prompt, max_tokens=128, top_k=32):
         print(f"  error: {e}", file=sys.stderr)
         return None
 
-def generate_thinking_data(model, text, max_tokens=256):
-    """Ask teacher to explain/elaborate on text with thinking traces."""
-    prompt = f"""Read this text carefully, then rewrite it in a way that makes the reasoning and knowledge explicit. Include your thinking process.
-
-Text: {text[:500]}
-
-Rewrite with explicit reasoning:"""
-
+def ask_teacher(model, prompt, max_tokens=512):
+    """Send a prompt to the teacher model via Ollama chat API.
+    Returns the full response including any thinking content."""
     try:
         resp = requests.post(OLLAMA_URL, json={
             "model": model,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "options": {
                 "num_predict": max_tokens,
                 "temperature": 0.7,
             },
-        }, timeout=120)
+        }, timeout=300)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("response", "")
+        msg = data.get("message", {})
+        content = msg.get("content", "")
+        thinking = msg.get("thinking", "")
+        # Qwen3.5 puts everything in thinking mode. Use whichever has content.
+        text = content.strip() if content.strip() else thinking.strip()
+        # Clean up thinking artifacts
+        text = text.replace("Thinking Process:", "").strip()
+        if len(text) > 30:
+            return text
+        return None
     except Exception as e:
-        print(f"  error: {e}", file=sys.stderr)
+        print(f"  error: {e}", file=sys.stderr, flush=True)
         return None
 
-def generate_qa_pairs(model, text, max_tokens=256):
+def generate_thinking_data(model, text, max_tokens=1000):
+    """Ask teacher to explain/elaborate on text with reasoning."""
+    prompt = f"Rewrite this text to make the reasoning and knowledge explicit. Be detailed and educational.\n\nText: {text[:500]}\n\nRewrite:"
+    return ask_teacher(model, prompt, max_tokens)
+
+def generate_qa_pairs(model, text, max_tokens=1000):
     """Ask teacher to generate Q&A pairs from text — Phi-style synthetic data."""
-    prompt = f"""Based on this text, generate 3 question-answer pairs that test understanding. Format each as:
-Q: [question]
-A: [detailed answer]
-
-Text: {text[:500]}
-
-Question-answer pairs:"""
-
-    try:
-        resp = requests.post(OLLAMA_URL, json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "num_predict": max_tokens,
-                "temperature": 0.7,
-            },
-        }, timeout=120)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("response", "")
-    except Exception as e:
-        print(f"  error: {e}", file=sys.stderr)
-        return None
+    prompt = f"Based on this text, generate 3 question-answer pairs. Format as Q: then A: for each.\n\nText: {text[:500]}\n\nQ&A:"
+    return ask_teacher(model, prompt, max_tokens)
 
 def main():
     parser = argparse.ArgumentParser(description="Generate distillation data")

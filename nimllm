@@ -19,6 +19,9 @@ case "${1:-help}" in
   train)
     exec "$SRC/microgpt" "${@:2}"
     ;;
+  continue)
+    exec "$SRC/microgpt" --continue
+    ;;
   chat)
     exec "$SRC/chat"
     ;;

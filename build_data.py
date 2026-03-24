@@ -88,6 +88,7 @@ def main():
         # 2. Books (~/data/books/*.txt + gutenberg/*.txt)
         book_files = glob.glob(os.path.join(BOOKS_DIR, "*.txt"))
         book_files += glob.glob(os.path.join(GUTENBERG_DIR, "*.txt"))
+        book_files += glob.glob(os.path.join(BOOKS_DIR, "curriculum", "*.txt"))
         # Exclude claude_conversations.txt (handled separately)
         book_files = [f for f in book_files if "claude_conversations" not in f]
         book_chunks = 0
@@ -100,7 +101,21 @@ def main():
         print(f"  books: {book_chunks} chunks from {len(set(book_files))} files")
         total_docs += book_chunks
 
-        # 3. Claude Code logs
+        # 3. Distilled Q&A data
+        distill_dir = os.path.join(ROOT, "distill_data")
+        distill_docs = 0
+        for df in glob.glob(os.path.join(distill_dir, "*.txt")):
+            for line in open(df):
+                line = line.strip()
+                if len(line) > 50:
+                    out.write(line + '\n')
+                    total_bytes += len(line) + 1
+                    distill_docs += 1
+        if distill_docs:
+            print(f"  distilled: {distill_docs} docs")
+            total_docs += distill_docs
+
+        # 4. Claude Code logs
         convos = extract_claude_conversations()
         for c in convos:
             out.write(c + '\n')
