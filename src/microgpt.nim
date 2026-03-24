@@ -171,14 +171,13 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     var lc: LayerCache
     let layer = m.layers[li]
 
-    # Save input for residual + rmsnorm backward
-    lc.x1 = trackedCreate(S * n)
-    gpuCopy(x, lc.x1, S * n)
+    # Save input for residual + rmsnorm backward (just save the pointer, no copy)
+    lc.x1 = x
     lc.xNorm1 = trackedCreate(S * n)
     lc.rms1 = trackedCreate(S)
     gpu_rmsnorm_affine_fwd(x.data, layer.ln1g.data, lc.xNorm1.data, lc.rms1.data, cint(S), cint(n))
 
-    # Q, K, V projections (GQA: K and V have fewer heads)
+    # Q, K, V projections — 3 separate matmuls (could fuse with batched GEMM later)
     lc.q = trackedCreate(S * n)
     lc.k = trackedCreate(S * nKvDim)
     lc.v = trackedCreate(S * nKvDim)
@@ -256,8 +255,7 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     cache.layerCaches.add(lc)
 
   # Final norm with learnable gamma
-  cache.xPreFinalNorm = trackedCreate(S * n)
-  gpuCopy(x, cache.xPreFinalNorm, S * n)
+  cache.xPreFinalNorm = x  # just save pointer, no copy
   cache.finalNormed = trackedCreate(S * n)
   cache.rmsF = trackedCreate(S)
   gpu_rmsnorm_affine_fwd(x.data, m.lnFg.data, cache.finalNormed.data, cache.rmsF.data, cint(S), cint(n))
@@ -773,16 +771,35 @@ when isMainModule:
         tokenizedDocs.add(ids32)
     echo &"  {tokenizedDocs.len} chunks in {cpuTime() - t0:.1f}s"
   else:
-    echo "loading data..."
-    let docs = loadDocs(dataFile)
-    let t0 = cpuTime()
-    for doc in docs:
-      let ids = tok.encode(doc)
-      var ids32 = newSeq[int32](ids.len)
-      for i in 0 ..< ids.len: ids32[i] = int32(ids[i])
-      if ids32.len >= 3:
-        tokenizedDocs.add(ids32)
-    echo &"  {tokenizedDocs.len} docs in {cpuTime() - t0:.1f}s"
+    # Load pre-tokenized binary if available (much faster than re-encoding)
+    let tokenBinFile = vidyaRoot / "training_tokens.bin"
+    if fileExists(tokenBinFile):
+      echo "loading pre-tokenized data..."
+      let t0 = cpuTime()
+      let s = newFileStream(tokenBinFile, fmRead)
+      let totalTokens = s.readInt32().int
+      # Split into chunks of blockSize for training
+      var chunk: seq[int32]
+      for i in 0 ..< totalTokens:
+        chunk.add(s.readInt32())
+        if chunk.len >= blockSize + 1:
+          tokenizedDocs.add(chunk)
+          chunk = @[]
+      if chunk.len >= 3:
+        tokenizedDocs.add(chunk)
+      s.close()
+      echo &"  {totalTokens} tokens -> {tokenizedDocs.len} chunks in {cpuTime() - t0:.1f}s"
+    else:
+      echo "loading text data (slow — run pre-tokenizer for fast startup)..."
+      let docs = loadDocs(dataFile)
+      let t0 = cpuTime()
+      for doc in docs:
+        let ids = tok.encode(doc)
+        var ids32 = newSeq[int32](ids.len)
+        for i in 0 ..< ids.len: ids32[i] = int32(ids[i])
+        if ids32.len >= 3:
+          tokenizedDocs.add(ids32)
+      echo &"  {tokenizedDocs.len} docs in {cpuTime() - t0:.1f}s"
 
   # Shuffle
   randomize()

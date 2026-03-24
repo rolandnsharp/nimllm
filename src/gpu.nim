@@ -64,6 +64,17 @@ proc cublasSaxpy*(handle: CublasHandle, n: cint,
                   y: pointer, incy: cint): CublasStatus
   {.importc: "cublasSaxpy_v2", header: "<cublas_v2.h>".}
 
+proc cublasSgemmStridedBatched*(handle: CublasHandle,
+    transa, transb: CublasOperation,
+    m, n, k: cint,
+    alpha: ptr cfloat,
+    a: pointer, lda: cint, strideA: clonglong,
+    b: pointer, ldb: cint, strideB: clonglong,
+    beta: ptr cfloat,
+    c: pointer, ldc: cint, strideC: clonglong,
+    batchCount: cint): CublasStatus
+  {.importc: "cublasSgemmStridedBatched", header: "<cublas_v2.h>".}
+
 # ── cuRAND ────────────────────────────────────────────────────────
 
 proc curandCreateGenerator*(gen: ptr CurandGenerator, rngType: cint): cint
