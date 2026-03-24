@@ -46,6 +46,8 @@ proc sample(logits: seq[float32], temperature: float32 = 0.6f,
 
 # ── Generation ────────────────────────────────────────────────────
 
+var gKv: KvCache  # global KV cache, persists across turns
+
 proc generate(m: Model, tok: Tokenizer, prompt: string,
               history: var seq[int32], maxTokens: int = 200): string =
   # Format prompt
@@ -66,14 +68,19 @@ proc generate(m: Model, tok: Tokenizer, prompt: string,
   let imStartId = tok.tokenToId.getOrDefault("<|im_start|>", -1)
   let imEndId = tok.tokenToId.getOrDefault("<|im_end|>", -1)
 
+  # Init KV cache on first use
+  if gKv.k.len == 0:
+    gKv = initKvCache()
+
+  # Process prompt tokens through KV cache (all at once)
+  var promptIds = newSeq[int32](inputTokens.len)
+  for i, id in inputTokens: promptIds[i] = int32(id)
+  var logits = forwardCached(m, gKv, promptIds)
+  freeStepAllocations()
+
+  # Generate tokens one at a time
   var response = ""
   for _ in 0 ..< maxTokens:
-    var context = history
-    if context.len > blockSize:
-      context = context[context.len - blockSize ..< context.len]
-
-    let (_, logits) = forward(m, context, context.len, saveCache = false)
-    freeStepAllocations()
     let tokenId = sample(logits)
 
     if tokenId == tok.bosId or tokenId == tok.userId or
@@ -85,6 +92,12 @@ proc generate(m: Model, tok: Tokenizer, prompt: string,
     let tokenStr = tok.vocab[tokenId]
     if "<|im_start|>" notin tokenStr and "<|im_end|>" notin tokenStr:
       response.add(tokenStr)
+      stdout.write(tokenStr)
+      stdout.flushFile()
+
+    # Next token: just the one we generated
+    logits = forwardCached(m, gKv, @[int32(tokenId)])
+    freeStepAllocations()
 
   response.strip()
 
@@ -139,6 +152,6 @@ when isMainModule:
     let input = stdin.readLine().strip()
     if input.len == 0: continue
 
-    let response = generate(m, tok, input, history)
-    echo response
+    discard generate(m, tok, input, history)
+    echo ""  # newline after streamed output
     echo ""

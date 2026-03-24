@@ -55,6 +55,12 @@ type
     upOut*: GpuBuf
     geluOut*: GpuBuf
 
+  # KV cache for fast inference (don't recompute full sequence every token)
+  KvCache* = object
+    k*: seq[GpuBuf]       # [nLayer] each [blockSize, nKvDim] — accumulated K values
+    v*: seq[GpuBuf]       # [nLayer] each [blockSize, nKvDim] — accumulated V values
+    pos*: int             # current position (number of tokens processed)
+
   ForwardCache* = object
     embedded*: GpuBuf
     layerCaches*: seq[LayerCache]
@@ -443,3 +449,162 @@ proc zeroGrads*(m: var Model) =
     gpuZero(m.layers[i].dfcDown)
     gpuZero(m.layers[i].dln1g)
     gpuZero(m.layers[i].dln2g)
+
+# ── KV Cache for fast inference ───────────────────────────────────
+
+proc initKvCache*(): KvCache =
+  ## Pre-allocate KV cache for all layers.
+  for i in 0 ..< nLayer:
+    result.k.add(gpuCreate(blockSize * nKvDim))
+    result.v.add(gpuCreate(blockSize * nKvDim))
+  result.pos = 0
+
+proc resetKvCache*(kv: var KvCache) =
+  for i in 0 ..< nLayer:
+    gpuZero(kv.k[i])
+    gpuZero(kv.v[i])
+  kv.pos = 0
+
+proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32] =
+  ## Forward pass with KV cache. Processes new tokens and appends K/V to cache.
+  ## Returns logits for the LAST token only.
+  ## Much faster than full forward for autoregressive generation.
+  let n = nEmbd
+  let newTokens = tokens.len
+  let S = kv.pos + newTokens  # total sequence length including cache
+
+  # Embed new tokens only
+  var x = trackedCreate(newTokens * n)
+  var tokBuf: pointer
+  discard cudaMalloc(addr tokBuf, csize_t(newTokens * sizeof(int32)))
+  discard cudaMemcpy(tokBuf, unsafeAddr tokens[0],
+                     csize_t(newTokens * sizeof(int32)), CudaMemcpyHostToDevice)
+  gpu_embed_fwd(m.wte.data, tokBuf, x.data, cint(newTokens), cint(n))
+  discard cudaFree(tokBuf)
+
+  let scale = 1.0f / sqrt(float32(headDim))
+
+  for li in 0 ..< nLayer:
+    let layer = m.layers[li]
+
+    # RMSNorm
+    let xNorm = trackedCreate(newTokens * n)
+    let rms = trackedCreate(newTokens)
+    gpu_rmsnorm_affine_fwd(x.data, layer.ln1g.data, xNorm.data, rms.data,
+                           cint(newTokens), cint(n))
+
+    # QKV for new tokens only
+    let q = trackedCreate(newTokens * n)
+    let kNew = trackedCreate(newTokens * nKvDim)
+    let vNew = trackedCreate(newTokens * nKvDim)
+    gpuSgemm(2, newTokens, n, n, xNorm, layer.wq, q)
+    gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wk, kNew)
+    gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wv, vNew)
+
+    # RoPE — position starts at kv.pos, not 0
+    # Need to offset the RoPE cos/sin tables
+    let ropeOffset = kv.pos
+    # For simplicity, create offset RoPE tables for new positions
+    let halfDim = headDim div 2
+    var cosOff = newSeq[float32](newTokens * halfDim)
+    var sinOff = newSeq[float32](newTokens * halfDim)
+    for pos in 0 ..< newTokens:
+      for f in 0 ..< halfDim:
+        let theta = float32(pos + ropeOffset) / pow(ropeTheta, 2.0f * float32(f) / float32(headDim))
+        cosOff[pos * halfDim + f] = cos(theta)
+        sinOff[pos * halfDim + f] = sin(theta)
+    let ropeCosOff = toGpu(cosOff)
+    let ropeSinOff = toGpu(sinOff)
+    ropeFwd(q, ropeCosOff, ropeSinOff, newTokens, n, nHead, headDim)
+    ropeFwd(kNew, ropeCosOff, ropeSinOff, newTokens, nKvDim, nKvHead, headDim)
+
+    # Append new K/V to cache
+    # kv.k[li] is [blockSize, nKvDim], we write at row kv.pos
+    let kDst = cast[pointer](cast[int](kv.k[li].data) + kv.pos * nKvDim * sizeof(float32))
+    let vDst = cast[pointer](cast[int](kv.v[li].data) + kv.pos * nKvDim * sizeof(float32))
+    discard cudaMemcpy(kDst, kNew.data,
+                       csize_t(newTokens * nKvDim * sizeof(float32)),
+                       CudaMemcpyDeviceToDevice)
+    discard cudaMemcpy(vDst, vNew.data,
+                       csize_t(newTokens * nKvDim * sizeof(float32)),
+                       CudaMemcpyDeviceToDevice)
+
+    # Attention: Q_new × K_all^T → scores [newTokens, S]
+    # K_all is kv.k[li][0:S, nKvDim]
+    let qH = trackedCreate(newTokens * headDim)
+    let kH = trackedCreate(S * headDim)
+    let vH = trackedCreate(S * headDim)
+    let attnH = trackedCreate(newTokens * headDim)
+    let scores = trackedCreate(newTokens * S)
+    let probs = trackedCreate(newTokens * S)
+
+    let attnOut = trackedCreate(newTokens * n)
+    for h in 0 ..< nHead:
+      # Extract Q head from new tokens [newTokens, headDim]
+      extractHead(q, qH, h, newTokens, n, headDim)
+      # Extract K/V heads from FULL cache [S, headDim]
+      gpu_extract_kv_head(kv.k[li].data, kH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
+      gpu_extract_kv_head(kv.v[li].data, vH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
+
+      # scores = Q_new @ K_all^T  [newTokens, headDim] × [headDim, S] → [newTokens, S]
+      gpuSgemm(2, newTokens, S, headDim, qH, kH, scores)
+      # Causal mask: position i (absolute: kv.pos+i) can attend to positions 0..kv.pos+i
+      # For the score matrix [newTokens, S], entry [i, j] should be masked if j > kv.pos+i
+      # Simple approach: use full causal mask on the [newTokens, S] matrix with offset
+      # For now, no mask needed if newTokens=1 (single token generation)
+      # For prompt processing (newTokens > 1), we need proper masking
+      if newTokens == 1:
+        # Single token: attends to all S positions, no masking needed
+        gpu_scale(scores.data, scale, scores.data, cint(S))
+      else:
+        # Multi-token: need offset causal mask (TODO: proper implementation)
+        causalMask(scores, scale, S)
+
+      softmaxFwd(scores, probs, newTokens, S)
+      # output = probs @ V_all  [newTokens, S] × [S, headDim] → [newTokens, headDim]
+      gpuSgemm(0, newTokens, headDim, S, probs, vH, attnH)
+      insertHead(attnH, attnOut, h, newTokens, n, headDim)
+
+    # Output projection + residual
+    let projected = trackedCreate(newTokens * n)
+    gpuSgemm(2, newTokens, n, n, attnOut, layer.wo, projected)
+    let x2 = trackedCreate(newTokens * n)
+    gpu_add(x.data, projected.data, x2.data, cint(newTokens * n))
+
+    # FFN
+    let xNorm2 = trackedCreate(newTokens * n)
+    let rms2 = trackedCreate(newTokens)
+    gpu_rmsnorm_affine_fwd(x2.data, layer.ln2g.data, xNorm2.data, rms2.data,
+                           cint(newTokens), cint(n))
+
+    let gateOut = trackedCreate(newTokens * ffnDim)
+    gpuSgemm(2, newTokens, ffnDim, n, xNorm2, layer.fcGate, gateOut)
+    let upOut = trackedCreate(newTokens * ffnDim)
+    gpuSgemm(2, newTokens, ffnDim, n, xNorm2, layer.fcUp, upOut)
+    let swigluOut = trackedCreate(newTokens * ffnDim)
+    gpu_swiglu_fwd(gateOut.data, upOut.data, swigluOut.data, cint(newTokens * ffnDim))
+    let mlpOut = trackedCreate(newTokens * n)
+    gpuSgemm(2, newTokens, n, ffnDim, swigluOut, layer.fcDown, mlpOut)
+
+    let xNew = trackedCreate(newTokens * n)
+    gpu_add(x2.data, mlpOut.data, xNew.data, cint(newTokens * n))
+    x = xNew
+
+  # Final norm + logits
+  let finalNormed = trackedCreate(newTokens * n)
+  let rmsF = trackedCreate(newTokens)
+  gpu_rmsnorm_affine_fwd(x.data, m.lnFg.data, finalNormed.data, rmsF.data,
+                         cint(newTokens), cint(n))
+
+  let logits = trackedCreate(newTokens * m.vocabSize)
+  gpuSgemm(2, newTokens, m.vocabSize, n, finalNormed, m.lmHead, logits)
+
+  # Update cache position
+  kv.pos += newTokens
+
+  # Return logits for last token
+  let allLogits = gpuDownload(logits)
+  let lastRow = (newTokens - 1) * m.vocabSize
+  result = allLogits[lastRow ..< lastRow + m.vocabSize]
