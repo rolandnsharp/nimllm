@@ -1,7 +1,8 @@
-## model.nim — nimllm model definition and forward pass
+## model.nim — nimllm model: forward pass + backward pass
 ##
-## Shared between training (microgpt.nim) and inference (chat.nim).
-## One forward pass. Two consumers. Zero duplication.
+## The complete model in one file. Forward and backward are two halves
+## of the same operation — separating them would require duplicating
+## the forward pass. Shared by training and inference.
 
 import gpu, autograd
 import std/[math, random, streams, strformat, tables]
@@ -290,3 +291,155 @@ proc forward*(m: Model, tokens: seq[int32], seqLen: int,
   var lastLogits = allLogits[lastRow ..< lastRow + m.vocabSize]
 
   (cache, lastLogits)
+
+# ── Backward pass ──────────────────────────────────────────────────
+
+proc backward*(m: var Model, tokens: seq[int32], seqLen: int,
+               cache: ForwardCache) =
+  ## Backward pass. Computes gradients for all weights.
+  ## Must be called after forward() with saveCache=true.
+  let S = seqLen
+  let n = nEmbd
+  let V = m.vocabSize
+
+  # dLogits = (exp(logProbs) - one_hot(target)) / S — entirely on GPU.
+  let dLogits = trackedCreate(S * V)
+  gpu_ce_backward(cache.logProbs.data, m.targetIdBuf, dLogits.data, cint(S), cint(V))
+
+  # dLmHead += dLogits^T @ finalNormed
+  gpuSgemm(5, V, n, S, dLogits, cache.finalNormed, m.dlmHead)
+  var dx = trackedCreate(S * n)
+  gpuSgemm(1, S, n, V, dLogits, m.lmHead, dx)
+
+  # Final RMSNorm backward
+  let dxPreNorm = trackedCreate(S * n)
+  gpu_rmsnorm_affine_bwd(cache.xPreFinalNorm.data, m.lnFg.data, dx.data,
+                         cache.rmsF.data, dxPreNorm.data, m.dlnFg.data,
+                         cint(S), cint(n))
+  dx = dxPreNorm
+
+  # Backward through layers in reverse
+  for li in countdown(nLayer - 1, 0):
+    let lc = cache.layerCaches[li]
+    let layer = m.layers[li]
+
+    let dMlpOut = trackedCreate(S * n)
+    gpuCopy(dx, dMlpOut, S * n)
+
+    # SwiGLU backward
+    let dSwigluOut = trackedCreate(S * ffnDim)
+    gpuSgemm(1, S, ffnDim, n, dMlpOut, layer.fcDown, dSwigluOut)
+    gpuSgemm(5, n, ffnDim, S, dMlpOut, lc.geluOut, m.layers[li].dfcDown)
+
+    let dGate = trackedCreate(S * ffnDim)
+    let dUp = trackedCreate(S * ffnDim)
+    gpu_swiglu_bwd(lc.fc1Out.data, lc.upOut.data, dSwigluOut.data,
+                   dGate.data, dUp.data, cint(S * ffnDim))
+
+    let dNorm2 = trackedCreate(S * n)
+    gpuSgemm(1, S, n, ffnDim, dGate, layer.fcGate, dNorm2)
+    gpuSgemm(5, ffnDim, n, S, dGate, lc.xNorm2, m.layers[li].dfcGate)
+
+    let dNorm2up = trackedCreate(S * n)
+    gpuSgemm(1, S, n, ffnDim, dUp, layer.fcUp, dNorm2up)
+    gpuSgemm(5, ffnDim, n, S, dUp, lc.xNorm2, m.layers[li].dfcUp)
+    gpu_add_inplace(dNorm2.data, dNorm2up.data, cint(S * n))
+
+    let dResid2 = trackedCreate(S * n)
+    gpu_rmsnorm_affine_bwd(lc.x2.data, layer.ln2g.data, dNorm2.data,
+                           lc.rms2.data, dResid2.data, m.layers[li].dln2g.data,
+                           cint(S), cint(n))
+    gpu_add_inplace(dx.data, dResid2.data, cint(S * n))
+
+    # Attention backward
+    let dAttnOut = trackedCreate(S * n)
+    gpuSgemm(1, S, n, n, dx, layer.wo, dAttnOut)
+    gpuSgemm(5, n, n, S, dx, lc.attnOut, m.layers[li].dwo)
+
+    let dq = trackedCreate(S * n)
+    let dk = trackedCreate(S * nKvDim)
+    let dv = trackedCreate(S * nKvDim)
+    let scale = 1.0f / sqrt(float32(headDim))
+
+    let doutH = trackedCreate(S * headDim)
+    let qH = trackedCreate(S * headDim)
+    let kH = trackedCreate(S * headDim)
+    let vH = trackedCreate(S * headDim)
+    let dqH = trackedCreate(S * headDim)
+    let dkH = trackedCreate(S * headDim)
+    let dvH = trackedCreate(S * headDim)
+    let bwdScores = trackedCreate(S * S)
+    let bwdProbs = trackedCreate(S * S)
+    let dWeights = trackedCreate(S * S)
+    let dScores = trackedCreate(S * S)
+
+    for h in 0 ..< nHead:
+      extractHead(dAttnOut, doutH, h, S, n, headDim)
+      extractHead(lc.q, qH, h, S, n, headDim)
+      gpu_extract_kv_head(lc.k.data, kH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
+      gpu_extract_kv_head(lc.v.data, vH.data, cint(h), cint(kvRepeat),
+                          cint(S), cint(nKvDim), cint(headDim))
+
+      gpuSgemm(2, S, S, headDim, qH, kH, bwdScores)
+      causalMask(bwdScores, scale, S)
+      softmaxFwd(bwdScores, bwdProbs, S, S)
+
+      gpuSgemm(2, S, S, headDim, doutH, vH, dWeights)
+      gpuSgemm(4, S, headDim, S, bwdProbs, doutH, dvH)
+
+      discard cudaMemset(dScores.data, 0, csize_t(S * S * sizeof(float32)))
+      softmaxBwd(bwdProbs, dWeights, dScores, S, S)
+      gpu_scale(dScores.data, scale, dScores.data, cint(S * S))
+
+      gpuSgemm(0, S, headDim, S, dScores, kH, dqH)
+      gpuSgemm(4, S, headDim, S, dScores, qH, dkH)
+
+      insertHeadAcc(dqH, dq, h, S, n, headDim)
+      gpu_insert_kv_head_acc(dkH.data, dk.data, cint(h), cint(kvRepeat),
+                             cint(S), cint(nKvDim), cint(headDim))
+      gpu_insert_kv_head_acc(dvH.data, dv.data, cint(h), cint(kvRepeat),
+                             cint(S), cint(nKvDim), cint(headDim))
+
+    ropeBwd(dq, m.ropeCos, m.ropeSin, S, n, nHead, headDim)
+    ropeBwd(dk, m.ropeCos, m.ropeSin, S, nKvDim, nKvHead, headDim)
+
+    let dNorm1 = trackedCreate(S * n)
+    gpuSgemm(1, S, n, n, dq, layer.wq, dNorm1)
+    gpuSgemm(5, n, n, S, dq, lc.xNorm1, m.layers[li].dwq)
+
+    let dNorm1k = trackedCreate(S * n)
+    gpuSgemm(1, S, n, nKvDim, dk, layer.wk, dNorm1k)
+    gpuSgemm(5, nKvDim, n, S, dk, lc.xNorm1, m.layers[li].dwk)
+    gpu_add_inplace(dNorm1.data, dNorm1k.data, cint(S * n))
+
+    let dNorm1v = trackedCreate(S * n)
+    gpuSgemm(1, S, n, nKvDim, dv, layer.wv, dNorm1v)
+    gpuSgemm(5, nKvDim, n, S, dv, lc.xNorm1, m.layers[li].dwv)
+    gpu_add_inplace(dNorm1.data, dNorm1v.data, cint(S * n))
+
+    let dResid1 = trackedCreate(S * n)
+    gpu_rmsnorm_affine_bwd(lc.x1.data, layer.ln1g.data, dNorm1.data,
+                           lc.rms1.data, dResid1.data, m.layers[li].dln1g.data,
+                           cint(S), cint(n))
+    gpu_add(dResid1.data, dx.data, dx.data, cint(S * n))
+
+  # Embedding backward
+  gpu_embed_bwd(m.dwte.data, m.tokIdBuf, dx.data, cint(S), cint(n))
+
+# ── Zero gradients ────────────────────────────────────────────────
+
+proc zeroGrads*(m: var Model) =
+  gpuZero(m.dwte)
+  gpuZero(m.dlmHead)
+  gpuZero(m.dlnFg)
+  for i in 0 ..< m.layers.len:
+    gpuZero(m.layers[i].dwq)
+    gpuZero(m.layers[i].dwk)
+    gpuZero(m.layers[i].dwv)
+    gpuZero(m.layers[i].dwo)
+    gpuZero(m.layers[i].dfcGate)
+    gpuZero(m.layers[i].dfcUp)
+    gpuZero(m.layers[i].dfcDown)
+    gpuZero(m.layers[i].dln1g)
+    gpuZero(m.layers[i].dln2g)
