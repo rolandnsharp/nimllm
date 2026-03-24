@@ -551,6 +551,27 @@ proc forward*(m: Model, tokens: seq[int32], seqLen: int,
 
 # ── Backward pass ──────────────────────────────────────────────────
 
+proc forwardTrain*(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32) =
+  ## Forward pass for training: returns cache + loss (not logits).
+  ## Computes log-softmax + cross-entropy loss on GPU.
+  var (cache, _) = forward(m, tokens, seqLen, saveCache = true)
+  let S = seqLen
+  let n = nEmbd
+
+  # Log-softmax
+  cache.logProbs = trackedCreate(S * m.vocabSize)
+  gpu_log_softmax(cache.logits.data, cache.logProbs.data, cint(S), cint(m.vocabSize))
+
+  # Upload targets and compute loss on GPU
+  var targets = newSeq[int32](S)
+  for i in 0 ..< S: targets[i] = tokens[i + 1]
+  discard cudaMemcpy(m.targetIdBuf, unsafeAddr targets[0],
+                     csize_t(S * sizeof(int32)), CudaMemcpyHostToDevice)
+  let lossScratch = trackedCreate(S)
+  let loss = gpu_ce_loss(cache.logProbs.data, m.targetIdBuf, lossScratch.data,
+                         cint(S), cint(m.vocabSize))
+  (cache, loss)
+
 proc backward*(m: var Model, tokens: seq[int32], seqLen: int,
                cache: ForwardCache) =
   ## Backward pass. Computes gradients for all weights.
