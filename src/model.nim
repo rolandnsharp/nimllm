@@ -248,6 +248,25 @@ proc loadModelGguf*(m: var Model, ggufPath: string) =
     assert raw.len == buf.numel * sizeof(float32), name & " size mismatch"
     discard cudaMemcpy(buf.data, unsafeAddr raw[0], csize_t(raw.len), CudaMemcpyHostToDevice)
 
+  proc f16toF32(b0, b1: uint8): float32 =
+    ## Convert IEEE float16 (2 bytes, little-endian) to float32
+    let h = (b1.uint16 shl 8) or b0.uint16
+    let sign = (h shr 15) and 1
+    let expo = (h shr 10) and 0x1F
+    let mant = h and 0x3FF
+    if expo == 0:
+      # Subnormal or zero
+      if mant == 0: return if sign == 1: -0.0f else: 0.0f
+      var m = mant.float32 / 1024.0f
+      var e = -14
+      result = (if sign == 1: -1.0f else: 1.0f) * m * pow(2.0f, e.float32)
+    elif expo == 31:
+      return if mant != 0: NaN else: (if sign == 1: -Inf else: Inf)
+    else:
+      let e = expo.int - 15
+      let m = 1.0f + mant.float32 / 1024.0f
+      result = (if sign == 1: -1.0f else: 1.0f) * m * pow(2.0f, e.float32)
+
   proc dequantQ8toF32(name: string, buf: GpuBuf) =
     ## Load Q8_0 tensor, dequantize on CPU, upload as float32
     let raw = gf.loadTensorRaw(name)
@@ -257,13 +276,8 @@ proc loadModelGguf*(m: var Model, ggufPath: string) =
     var pos = 0
     for b in 0 ..< nBlocks:
       let base = b * 34
-      # Scale is float16 (2 bytes)
-      let scaleBytes = (raw[base + 1].uint16 shl 8) or raw[base].uint16
-      var scaleBuf: array[4, uint8]
-      let expanded = scaleBytes.uint32 shl 16
-      copyMem(addr scaleBuf[0], unsafeAddr expanded, 4)
-      var scale: float32
-      copyMem(addr scale, addr scaleBuf[0], 4)
+      # Scale is IEEE float16 (NOT BF16!)
+      let scale = f16toF32(raw[base], raw[base + 1])
       # Dequant 32 int8 values
       for i in 0 ..< 32:
         let v = cast[int8](raw[base + 2 + i])
