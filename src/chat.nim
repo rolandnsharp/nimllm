@@ -68,19 +68,24 @@ proc generate(m: Model, tok: Tokenizer, prompt: string,
   let imStartId = tok.tokenToId.getOrDefault("<|im_start|>", -1)
   let imEndId = tok.tokenToId.getOrDefault("<|im_end|>", -1)
 
-  # Init KV cache on first use
+  # Init or reset KV cache if near full
   if gKv.k.len == 0:
     gKv = initKvCache()
+  elif gKv.pos + inputTokens.len + maxTokens >= blockSize:
+    resetKvCache(gKv)
+    history.setLen(0)
 
   # Process prompt tokens through KV cache (one at a time for correct causal masking)
   var logits: seq[float32]
   for id in inputTokens:
+    if gKv.pos >= blockSize - 1: break  # safety check
     logits = forwardCached(m, gKv, @[int32(id)])
     freeStepAllocations()
 
   # Generate tokens one at a time
   var response = ""
   for _ in 0 ..< maxTokens:
+    if gKv.pos >= blockSize - 1: break  # context full
     let tokenId = sample(logits)
 
     if tokenId == tok.bosId or tokenId == tok.userId or
