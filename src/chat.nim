@@ -138,9 +138,8 @@ when isMainModule:
     echo "no model found at ", modelFile
     quit(1)
 
-  # Quantize weights to Q4_0 for fast inference (only helps at 2048+ dim)
-  if nEmbd >= 2048:
-    quantizeModel(m)
+  # Quantize weights to Q4_0 for fast inference
+  quantizeModel(m)
 
   randomize()
   trackingEnabled = true
