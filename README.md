@@ -150,6 +150,32 @@ The training set includes:
 - Distilled data from Qwen3.5 (reasoning quality)
 - The Book of nimllm (self-knowledge)
 
+## Performance
+
+Inference speed on RTX 3060 12GB (SmolLM2-135M):
+
+```
+nimllm:     ~370 tokens/sec  (Q4_0 quantized, KV cache, zero-copy attention)
+llama.cpp:  ~530 tokens/sec  (same model, same GPU)
+Gap:        1.4x
+```
+
+Speed progression during development:
+```
+  2 tok/s    before KV cache (recomputing full sequence every token)
+133 tok/s    after KV cache
+149 tok/s    after Q4_0 quantization
+370 tok/s    after zero-copy per-head attention (eliminated 540 kernel launches)
+```
+
+Optimizations used:
+- **KV cache** — compute only the new token, not the full sequence
+- **Q4_0 quantization** — 4-bit weights, 7x compression (621MB → 72MB)
+- **Per-head KV cache** — zero-copy attention, no extract/insert kernels
+- **Warp-level reduction** — `__shfl_down_sync` instead of shared memory
+- **Pre-tokenized binary** — 49M tokens load in 1.4 seconds
+- **Scratch arena** — zero cudaMalloc in the hot loop
+
 ## Hardware
 
 NVIDIA GPU with 8-12GB VRAM. Tested on RTX 3060 12GB.

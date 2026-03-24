@@ -23,12 +23,21 @@ bpe.nim        — tokenizer
 autograd.nim   — scratch arena
 ```
 
-## Next: Performance
+## Performance: 370 tok/s (1.4x off llama.cpp)
 
-- [ ] Batched GEMM for attention heads (one call instead of 9)
+Done:
+- [x] KV cache (2 → 133 tok/s)
+- [x] Q4_0 quantization with optimized kernel (133 → 149 tok/s)
+- [x] Per-head zero-copy attention (149 → 370 tok/s)
+- [x] Pre-tokenized binary data loading (1.4s startup)
+- [x] Scratch arena (zero cudaMalloc in hot loop)
+- [x] Sequence packing (batch 8 for training)
+
+To close the remaining 1.4x gap:
+- [ ] CUDA graphs (capture single-token forward, replay without CPU)
 - [ ] Fused QKV projection (one matmul instead of 3)
-- [ ] KV cache for fast inference (don't recompute full sequence every token)
-- [ ] Currently ~24% GPU utilization, target 50%+
+- [ ] Fused RMSNorm + projection kernel
+- [ ] Copy llama.cpp's optimized Q4_0 dequant kernel
 
 ## Next: Memory Through Training
 
