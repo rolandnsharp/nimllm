@@ -29,8 +29,38 @@ text. It cannot learn. It cannot grow. It cannot absorb a book you give it.
 
 nimllm's weights are alive. Every conversation, every book, every training
 pass changes them. The model accumulates knowledge over time like a mind
-accumulates experience. Inference and training are not separate programs —
-they share the same forward pass because learning IS inference plus feedback.
+accumulates experience.
+
+## Why Inference And Training Are One Program
+
+llama.cpp separates inference from training. So does PyTorch. So does
+every major framework. They treat inference as a product and training
+as a separate research activity.
+
+This forces you to maintain two copies of the forward pass — one for
+inference and one for training. Every architecture change, every bug fix,
+every optimization must be applied twice. The code diverges. Bugs hide
+in the gap.
+
+nimllm keeps them together because they ARE the same computation.
+Training is inference plus a backward pass plus an optimizer step.
+The forward pass is identical — the only difference is whether you
+save intermediate values for the backward pass. One flag controls that:
+
+```nim
+let (cache, logits) = forward(m, tokens, seqLen, saveCache = true)   # training
+let (_, logits)     = forward(m, tokens, seqLen, saveCache = false)  # inference
+```
+
+Same function. Same code path. Same bugs (or lack of them). When the
+model infers, it uses the exact same computation it was trained with.
+When it trains, it uses the exact same computation it infers with.
+
+This matters because nimllm's purpose is continuous learning. The model
+doesn't stop training when you chat with it. A conversation can become
+training data. A book can become weights. The line between using the
+model and improving the model doesn't exist. Separating inference from
+training would mean separating the model from its ability to grow.
 
 ## Architecture
 
