@@ -4,7 +4,7 @@
 ## of the same operation — separating them would require duplicating
 ## the forward pass. Shared by training and inference.
 
-import gpu, autograd
+import gpu, autograd, gguf
 import std/[math, random, streams, strformat, tables]
 
 # ── Configuration ─────────────────────────────────────────────────
@@ -20,7 +20,9 @@ const
   blockSize* = 512
   ffnDim*   = 8192
   ropeTheta* = 500000.0f
-  frozenLayers* = 12     # freeze bottom layers for fine-tuning (0 = train all)
+  frozenLayers* = 12
+
+var gQuantType*: int = 0  # 0=Q4_0, 8=Q8_0, set during model load     # freeze bottom layers for fine-tuning (0 = train all)
 
 # ── Types ─────────────────────────────────────────────────────────
 
@@ -41,7 +43,8 @@ type
     wte*, lmHead*, lnFg*: GpuBuf
     layers*: seq[Layer]
     vocabSize*: int
-    quantized*: bool        # true if Q4_0 weights are available
+    quantized*: bool        # true if quantized weights are available
+    quantType*: int         # 0=Q4_0, 8=Q8_0
     dwte*, dlmHead*, dlnFg*: GpuBuf
     tokIdBuf*: pointer
     targetIdBuf*: pointer
@@ -80,7 +83,7 @@ type
 
 # ── Init ──────────────────────────────────────────────────────────
 
-proc initModel*(vocabSize: int, withGradients: bool = true): Model =
+proc initModel*(vocabSize: int, withGradients: bool = true, withWeights: bool = true): Model =
   randomize(42)
   let std = 0.02f
 
@@ -98,8 +101,14 @@ proc initModel*(vocabSize: int, withGradients: bool = true): Model =
     toGpu(h)
 
   result.vocabSize = vocabSize
-  result.wte = randBuf(vocabSize * nEmbd)
-  result.lmHead = randBuf(vocabSize * nEmbd)
+  if withWeights:
+    result.wte = randBuf(vocabSize * nEmbd)
+    result.lmHead = randBuf(vocabSize * nEmbd)
+  else:
+    # GGUF mode: allocate float32 only for embeddings (needed for lookup)
+    # and norms. Weight matrices loaded as Q8_0 directly.
+    result.wte = gpuCreate(vocabSize * nEmbd)
+    result.lmHead = gpuCreate(vocabSize * nEmbd)
   result.lnFg = onesBuf(nEmbd)
 
   if withGradients:
@@ -109,17 +118,23 @@ proc initModel*(vocabSize: int, withGradients: bool = true): Model =
 
   for i in 0 ..< nLayer:
     let resStd = std / sqrt(float32(2 * nLayer))
-    var layer = Layer(
-      wq: randBuf(nEmbd * nEmbd),
-      wk: randBuf(nKvDim * nEmbd),
-      wv: randBuf(nKvDim * nEmbd),
-      wo: randBuf(nEmbd * nEmbd, resStd),
-      fcGate: randBuf(ffnDim * nEmbd),
-      fcUp: randBuf(ffnDim * nEmbd),
-      fcDown: randBuf(nEmbd * ffnDim, resStd),
-      ln1g: onesBuf(nEmbd),
-      ln2g: onesBuf(nEmbd),
-    )
+    var layer: Layer
+    if withWeights:
+      layer = Layer(
+        wq: randBuf(nEmbd * nEmbd),
+        wk: randBuf(nKvDim * nEmbd),
+        wv: randBuf(nKvDim * nEmbd),
+        wo: randBuf(nEmbd * nEmbd, resStd),
+        fcGate: randBuf(ffnDim * nEmbd),
+        fcUp: randBuf(ffnDim * nEmbd),
+        fcDown: randBuf(nEmbd * ffnDim, resStd),
+        ln1g: onesBuf(nEmbd),
+        ln2g: onesBuf(nEmbd),
+      )
+    else:
+      # GGUF mode: only allocate norms (weight matrices come from GGUF Q8_0)
+      layer.ln1g = onesBuf(nEmbd)
+      layer.ln2g = onesBuf(nEmbd)
     if withGradients:
       layer.dwq = gpuCreate(nEmbd * nEmbd)
       layer.dwk = gpuCreate(nKvDim * nEmbd)
@@ -209,6 +224,85 @@ proc loadModel*(m: var Model, filename: string) =
 
 # ── Q4_0 Quantization for fast inference ─────────────────────────
 
+proc loadModelGguf*(m: var Model, ggufPath: string) =
+  ## Load model directly from GGUF file (Ollama format).
+  ## Q8_0 weights load directly — no float32 intermediate, no OOM.
+  echo "loading GGUF from ", ggufPath, "..."
+  let gf = openGguf(ggufPath)
+
+  proc uploadQ8(name: string): pointer =
+    ## Load Q8_0 tensor raw bytes to GPU
+    let raw = gf.loadTensorRaw(name)
+    if raw.len == 0: return nil
+    var p: pointer
+    let err = cudaMalloc(addr p, csize_t(raw.len))
+    assert err == CudaSuccess, "cudaMalloc failed for " & name
+    discard cudaMemcpy(p, unsafeAddr raw[0], csize_t(raw.len), CudaMemcpyHostToDevice)
+    p
+
+  proc uploadF32(name: string, buf: GpuBuf) =
+    ## Load F32 tensor and upload to existing GpuBuf
+    let raw = gf.loadTensorRaw(name)
+    if raw.len == 0: return
+    # Raw is already float32 bytes
+    assert raw.len == buf.numel * sizeof(float32), name & " size mismatch"
+    discard cudaMemcpy(buf.data, unsafeAddr raw[0], csize_t(raw.len), CudaMemcpyHostToDevice)
+
+  proc dequantQ8toF32(name: string, buf: GpuBuf) =
+    ## Load Q8_0 tensor, dequantize on CPU, upload as float32
+    let raw = gf.loadTensorRaw(name)
+    if raw.len == 0: return
+    let nBlocks = raw.len div 34  # 34 bytes per Q8_0 block
+    var f32 = newSeq[float32](nBlocks * 32)
+    var pos = 0
+    for b in 0 ..< nBlocks:
+      let base = b * 34
+      # Scale is float16 (2 bytes)
+      let scaleBytes = (raw[base + 1].uint16 shl 8) or raw[base].uint16
+      var scaleBuf: array[4, uint8]
+      let expanded = scaleBytes.uint32 shl 16
+      copyMem(addr scaleBuf[0], unsafeAddr expanded, 4)
+      var scale: float32
+      copyMem(addr scale, addr scaleBuf[0], 4)
+      # Dequant 32 int8 values
+      for i in 0 ..< 32:
+        let v = cast[int8](raw[base + 2 + i])
+        f32[pos] = scale * float32(v)
+        pos += 1
+    gpuUpload(buf, f32)
+
+  # Embeddings: dequant Q8_0 → float32 (lookup table, needs float32)
+  echo "  loading embeddings..."
+  dequantQ8toF32("token_embd.weight", m.wte)
+  if "output.weight" in gf.tensors:
+    dequantQ8toF32("output.weight", m.lmHead)
+  else:
+    # Tied weights — copy from wte
+    gpuCopy(m.wte, m.lmHead, m.wte.numel)
+
+  # Final norm (F32)
+  uploadF32("output_norm.weight", m.lnFg)
+
+  # Layers: load Q8_0 weight matrices directly (no dequant)
+  for li in 0 ..< nLayer:
+    echo &"  layer {li+1}/{nLayer}"
+    let p = &"blk.{li}"
+    m.layers[li].wq_q4 = uploadQ8(&"{p}.attn_q.weight")
+    m.layers[li].wk_q4 = uploadQ8(&"{p}.attn_k.weight")
+    m.layers[li].wv_q4 = uploadQ8(&"{p}.attn_v.weight")
+    m.layers[li].wo_q4 = uploadQ8(&"{p}.attn_output.weight")
+    m.layers[li].fcGate_q4 = uploadQ8(&"{p}.ffn_gate.weight")
+    m.layers[li].fcUp_q4 = uploadQ8(&"{p}.ffn_up.weight")
+    m.layers[li].fcDown_q4 = uploadQ8(&"{p}.ffn_down.weight")
+    # Norms (F32)
+    uploadF32(&"{p}.attn_norm.weight", m.layers[li].ln1g)
+    uploadF32(&"{p}.ffn_norm.weight", m.layers[li].ln2g)
+
+  m.quantized = true
+  m.quantType = 8  # Q8_0
+  gQuantType = 8
+  echo "  done (GGUF Q8_0 loaded directly)"
+
 proc quantizeQ4(buf: GpuBuf): pointer =
   ## Quantize a float32 GPU buffer to Q4_0. Returns pointer to Q4_0 data.
   ## Q4_0: 18 bytes per 32 floats (block_q4_0 = {half d, uint8 qs[16]}).
@@ -237,6 +331,15 @@ proc quantizeModel*(m: var Model) =
   let origMB = (m.vocabSize * nEmbd * 2 + nLayer * (2*nEmbd*nEmbd + 2*nKvDim*nEmbd + 3*ffnDim*nEmbd)) * 4 div (1024*1024)
   let q4MB = (m.vocabSize * nEmbd + nLayer * (nEmbd*nEmbd + nKvDim*nEmbd + nKvDim*nEmbd + nEmbd*nEmbd + ffnDim*nEmbd + ffnDim*nEmbd + nEmbd*ffnDim)) * 18 div 32 div (1024*1024)
   echo &"  done ({origMB}MB float32 → ~{q4MB}MB Q4_0)"
+
+# ── Quantized matvec dispatch ─────────────────────────────────────
+
+proc quantMatvec(A: pointer, x: pointer, y: pointer, rows, cols: cint) =
+  ## Dispatch to the right dequant kernel based on quantization type
+  if gQuantType == 8:
+    gpu_matvec_q8_0(A, x, y, rows, cols)
+  else:
+    gpu_matvec_q4_0(A, x, y, rows, cols)
 
 # ── Forward pass ──────────────────────────────────────────────────
 
@@ -544,9 +647,9 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
     let vNew = trackedCreate(newTokens * nKvDim)
     if m.quantized and newTokens == 1:
       # Q4_0 matvec: 7x less memory bandwidth
-      gpu_matvec_q4_0(layer.wq_q4, xNorm.data, q.data, cint(n), cint(n))
-      gpu_matvec_q4_0(layer.wk_q4, xNorm.data, kNew.data, cint(nKvDim), cint(n))
-      gpu_matvec_q4_0(layer.wv_q4, xNorm.data, vNew.data, cint(nKvDim), cint(n))
+      quantMatvec(layer.wq_q4, xNorm.data, q.data, cint(n), cint(n))
+      quantMatvec(layer.wk_q4, xNorm.data, kNew.data, cint(nKvDim), cint(n))
+      quantMatvec(layer.wv_q4, xNorm.data, vNew.data, cint(nKvDim), cint(n))
     else:
       gpuSgemm(2, newTokens, n, n, xNorm, layer.wq, q)
       gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wk, kNew)
@@ -609,7 +712,7 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
     # Output projection + residual
     let projected = trackedCreate(newTokens * n)
     if m.quantized and newTokens == 1:
-      gpu_matvec_q4_0(layer.wo_q4, attnOut.data, projected.data, cint(n), cint(n))
+      quantMatvec(layer.wo_q4, attnOut.data, projected.data, cint(n), cint(n))
     else:
       gpuSgemm(2, newTokens, n, n, attnOut, layer.wo, projected)
     let x2 = trackedCreate(newTokens * n)
@@ -624,8 +727,8 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
     let gateOut = trackedCreate(newTokens * ffnDim)
     let upOut = trackedCreate(newTokens * ffnDim)
     if m.quantized and newTokens == 1:
-      gpu_matvec_q4_0(layer.fcGate_q4, xNorm2.data, gateOut.data, cint(ffnDim), cint(n))
-      gpu_matvec_q4_0(layer.fcUp_q4, xNorm2.data, upOut.data, cint(ffnDim), cint(n))
+      quantMatvec(layer.fcGate_q4, xNorm2.data, gateOut.data, cint(ffnDim), cint(n))
+      quantMatvec(layer.fcUp_q4, xNorm2.data, upOut.data, cint(ffnDim), cint(n))
     else:
       gpuSgemm(2, newTokens, ffnDim, n, xNorm2, layer.fcGate, gateOut)
       gpuSgemm(2, newTokens, ffnDim, n, xNorm2, layer.fcUp, upOut)
@@ -633,7 +736,7 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
     gpu_swiglu_fwd(gateOut.data, upOut.data, swigluOut.data, cint(newTokens * ffnDim))
     let mlpOut = trackedCreate(newTokens * n)
     if m.quantized and newTokens == 1:
-      gpu_matvec_q4_0(layer.fcDown_q4, swigluOut.data, mlpOut.data, cint(n), cint(ffnDim))
+      quantMatvec(layer.fcDown_q4, swigluOut.data, mlpOut.data, cint(n), cint(ffnDim))
     else:
       gpuSgemm(2, newTokens, n, ffnDim, swigluOut, layer.fcDown, mlpOut)
 
@@ -649,7 +752,7 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
 
   let logits = trackedCreate(newTokens * m.vocabSize)
   if m.quantized and newTokens == 1:
-    gpu_matvec_q4_0(m.lmHead_q4, finalNormed.data, logits.data, cint(m.vocabSize), cint(n))
+    quantMatvec(m.lmHead_q4, finalNormed.data, logits.data, cint(m.vocabSize), cint(n))
   else:
     gpuSgemm(2, newTokens, m.vocabSize, n, finalNormed, m.lmHead, logits)
 

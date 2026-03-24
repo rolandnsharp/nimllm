@@ -34,25 +34,30 @@ proc readGgufString(s: Stream): string =
   if n > 0:
     discard s.readData(addr result[0], n)
 
+proc skipBytes(s: Stream, n: int) =
+  s.setPosition(s.getPosition() + n)
+
 proc skipGgufValue(s: Stream, typ: int32) =
   case typ
-  of 0: discard s.readUint8()     # uint8
-  of 1: discard s.readInt8()      # int8
-  of 2: discard s.readData(nil, 2) # uint16 - skip
-  of 3: discard s.readData(nil, 2) # int16
-  of 4: discard s.readUint32()    # uint32
-  of 5: discard s.readInt32()     # int32
-  of 6: discard s.readData(nil, 4) # float32
-  of 7: discard s.readUint8()     # bool
+  of 0: skipBytes(s, 1)           # uint8
+  of 1: skipBytes(s, 1)           # int8
+  of 2: skipBytes(s, 2)           # uint16
+  of 3: skipBytes(s, 2)           # int16
+  of 4: skipBytes(s, 4)           # uint32
+  of 5: skipBytes(s, 4)           # int32
+  of 6: skipBytes(s, 4)           # float32
+  of 7: skipBytes(s, 1)           # bool
   of 8: discard readGgufString(s) # string
   of 9: # array
     let atype = s.readInt32()
     let alen = s.readInt64()
     for i in 0 ..< alen:
       skipGgufValue(s, atype)
-  of 10: discard s.readData(nil, 8) # uint64
-  of 12: discard s.readData(nil, 8) # float64
-  else: discard
+  of 10: skipBytes(s, 8)          # uint64
+  of 11: skipBytes(s, 8)          # int64
+  of 12: skipBytes(s, 8)          # float64
+  else:
+    echo "  WARNING: unknown GGUF type ", typ
 
 proc openGguf*(path: string): GgufFile =
   ## Parse GGUF header and tensor metadata. Does not load tensor data.

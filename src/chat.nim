@@ -131,6 +131,9 @@ when isMainModule:
   let vidyaRoot = baseDir.parentDir()
   let tokenizerFile = vidyaRoot / "tokenizer_nim.bin"
   let modelFile = vidyaRoot / "nimllm.bin"
+  # Check for GGUF file argument or Ollama model
+  let ggufFile = if paramCount() >= 2 and paramStr(1) == "--gguf": paramStr(2)
+                 else: ""
 
   gpuInit()
 
@@ -139,18 +142,31 @@ when isMainModule:
     quit(1)
   let tok = loadTokenizer(tokenizerFile)
 
-  var m = initModel(tok.vocab.len, withGradients = false)
-  if fileExists(modelFile):
+  var m: Model
+  if ggufFile.len > 0:
+    # Minimal init — only alloc embeddings + norms, not float32 weight matrices
+    m = initModel(tok.vocab.len, withGradients = false, withWeights = false)
+    loadModelGguf(m, ggufFile)
+    # Already quantized — skip Q4_0 quantization
+  elif fileExists(modelFile):
     loadModel(m, modelFile)
+    if nEmbd >= 2048: quantizeModel(m)  # quantize float32 to Q4_0
   else:
     echo "no model found at ", modelFile
+    echo "usage: chat [--gguf <path_to_gguf>]"
     quit(1)
 
-  # Quantize weights to Q4_0 for fast inference
-  quantizeModel(m)
+  # Quantize to Q4_0 only if not already quantized (GGUF loads Q8_0 directly)
+  if not m.quantized and nEmbd >= 2048:
+    quantizeModel(m)
 
   randomize()
-  trackingEnabled = true
+  # For inference, use small arena (1 token at a time with KV cache)
+  # Don't allocate the huge training arena
+  let infS = 32  # max tokens per forward (prompt processing)
+  let infArena = (infS * nEmbd * 20 + infS * infS * 4 + infS * m.vocabSize * 2) * nLayer div 4
+  initScratchArena(infArena)
+  echo &"  inference arena: {infArena * 4 div 1024 div 1024}MB"
 
   # Non-interactive mode
   if paramCount() >= 2 and paramStr(1) == "--prompt":
