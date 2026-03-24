@@ -473,14 +473,11 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
   let newTokens = tokens.len
   let S = kv.pos + newTokens  # total sequence length including cache
 
-  # Embed new tokens only
+  # Embed new tokens only (reuse model's pre-allocated tokIdBuf)
   var x = trackedCreate(newTokens * n)
-  var tokBuf: pointer
-  discard cudaMalloc(addr tokBuf, csize_t(newTokens * sizeof(int32)))
-  discard cudaMemcpy(tokBuf, unsafeAddr tokens[0],
+  discard cudaMemcpy(m.tokIdBuf, unsafeAddr tokens[0],
                      csize_t(newTokens * sizeof(int32)), CudaMemcpyHostToDevice)
-  gpu_embed_fwd(m.wte.data, tokBuf, x.data, cint(newTokens), cint(n))
-  discard cudaFree(tokBuf)
+  gpu_embed_fwd(m.wte.data, m.tokIdBuf, x.data, cint(newTokens), cint(n))
 
   let scale = 1.0f / sqrt(float32(headDim))
 
@@ -501,20 +498,14 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
     gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wk, kNew)
     gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wv, vNew)
 
-    # RoPE — position starts at kv.pos, not 0
-    # Need to offset the RoPE cos/sin tables
-    let ropeOffset = kv.pos
-    # For simplicity, create offset RoPE tables for new positions
+    # RoPE — use model's pre-computed tables with position offset
+    # The tables are [blockSize, halfDim]. We need rows starting at kv.pos.
     let halfDim = headDim div 2
-    var cosOff = newSeq[float32](newTokens * halfDim)
-    var sinOff = newSeq[float32](newTokens * halfDim)
-    for pos in 0 ..< newTokens:
-      for f in 0 ..< halfDim:
-        let theta = float32(pos + ropeOffset) / pow(ropeTheta, 2.0f * float32(f) / float32(headDim))
-        cosOff[pos * halfDim + f] = cos(theta)
-        sinOff[pos * halfDim + f] = sin(theta)
-    let ropeCosOff = toGpu(cosOff)
-    let ropeSinOff = toGpu(sinOff)
+    let ropeOffset = kv.pos * halfDim * sizeof(float32)
+    let cosPtr = cast[pointer](cast[int](m.ropeCos.data) + ropeOffset)
+    let sinPtr = cast[pointer](cast[int](m.ropeSin.data) + ropeOffset)
+    var ropeCosOff = GpuBuf(data: cosPtr, numel: newTokens * halfDim)
+    var ropeSinOff = GpuBuf(data: sinPtr, numel: newTokens * halfDim)
     ropeFwd(q, ropeCosOff, ropeSinOff, newTokens, n, nHead, headDim)
     ropeFwd(kNew, ropeCosOff, ropeSinOff, newTokens, nKvDim, nKvHead, headDim)
 
