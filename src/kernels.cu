@@ -935,7 +935,9 @@ __global__ void k_quantize_q4_0(const float *x, block_q4_0 *y, int n) {
  * A is [rows, cols] in Q4_0 format (cols must be multiple of 32)
  * x is [cols] float32
  * y is [rows] float32
- * One thread block per row. */
+ *
+ * Optimized: cache x in shared memory, warp-level reduction,
+ * process multiple Q4_0 blocks per thread for better ILP. */
 __global__ void k_matvec_q4_0(const block_q4_0 *A, const float *x, float *y,
                                int rows, int cols) {
     int row = blockIdx.x;
@@ -944,33 +946,49 @@ __global__ void k_matvec_q4_0(const block_q4_0 *A, const float *x, float *y,
     int blocks_per_row = cols / QK4_0;
     const block_q4_0 *row_blocks = A + row * blocks_per_row;
 
-    extern __shared__ float sdata[];
-    float sum = 0.0f;
+    /* Cache input vector in shared memory — read once, use by all threads */
+    extern __shared__ float sx[];
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        sx[i] = x[i];
+    __syncthreads();
 
-    /* Each thread handles multiple blocks */
+    /* Each thread accumulates over multiple Q4_0 blocks */
+    float sum = 0.0f;
     for (int b = threadIdx.x; b < blocks_per_row; b += blockDim.x) {
         float d = __half2float(row_blocks[b].d);
         const uint8_t *qs = row_blocks[b].qs;
-        const float *xb = x + b * QK4_0;
+        int base = b * QK4_0;
 
-        /* Unpack and multiply */
+        /* Unroll: process all 16 bytes (32 values) per block */
+        float local_sum = 0.0f;
         for (int i = 0; i < QK4_0_BYTES; i++) {
-            int v0 = (qs[i] & 0x0F) - 8;
-            int v1 = (qs[i] >> 4) - 8;
-            sum += d * (float)v0 * xb[i*2 + 0];
-            sum += d * (float)v1 * xb[i*2 + 1];
+            uint8_t q = qs[i];
+            local_sum += (float)((q & 0x0F) - 8) * sx[base + i*2 + 0];
+            local_sum += (float)((q >> 4)   - 8) * sx[base + i*2 + 1];
         }
+        sum += d * local_sum;
     }
 
-    /* Parallel reduction in shared memory */
-    sdata[threadIdx.x] = sum;
+    /* Warp-level reduction (no shared memory needed, no __syncthreads) */
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    /* First thread of each warp writes partial sum */
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    /* Use shared memory only for cross-warp reduction */
+    if (lane_id == 0) sx[warp_id] = sum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int)threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
 
-    if (threadIdx.x == 0) y[row] = sdata[0];
+    /* First warp reduces across warps */
+    if (warp_id == 0) {
+        int num_warps = blockDim.x / 32;
+        sum = (lane_id < num_warps) ? sx[lane_id] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane_id == 0) y[row] = sum;
+    }
 }
 
 void gpu_quantize_q4_0(const float *x, void *y, int n) {
@@ -981,8 +999,10 @@ void gpu_quantize_q4_0(const float *x, void *y, int n) {
 
 void gpu_matvec_q4_0(const void *A, const float *x, float *y,
                       int rows, int cols) {
-    int threads = 128;
-    k_matvec_q4_0<<<rows, threads, threads * sizeof(float)>>>(
+    /* 256 threads = 8 warps. Shared memory holds input vector (cols floats). */
+    int threads = 256;
+    int smem = cols * sizeof(float);  /* cache input vector */
+    k_matvec_q4_0<<<rows, threads, smem>>>(
         (const block_q4_0 *)A, x, y, rows, cols);
 }
 
