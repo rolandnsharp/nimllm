@@ -293,6 +293,12 @@ proc gpu_ce_backward*(log_probs, targets, d_logits: pointer, S, V: cint)
 proc gpu_ce_loss*(log_probs, targets, scratch: pointer, S, V: cint): cfloat
   {.importc, cdecl.}
 
+# ── Q4_0 Quantization ────────────────────────────────────────────
+proc gpu_quantize_q4_0*(x: pointer, y: pointer, n: cint)
+  {.importc, cdecl.}
+proc gpu_matvec_q4_0*(A: pointer, x: pointer, y: pointer, rows, cols: cint)
+  {.importc, cdecl.}
+
 # ── High-level wrappers using GpuBuf ─────────────────────────────
 
 proc geluFwd*(x, y: GpuBuf) =

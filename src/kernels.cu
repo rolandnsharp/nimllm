@@ -4,9 +4,11 @@
  * Called directly from Nim via {.importc.} pragmas. */
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <curand.h>
 #include <math.h>
 #include <float.h>
+#include <stdint.h>
 
 #define BLOCK 256
 
@@ -882,6 +884,106 @@ float gpu_ce_loss(const float *log_probs, const int *targets,
     for (int i = 0; i < S; i++) sum += h[i];
     free(h);
     return sum / (float)S;
+}
+
+/* ── Q4_0 Quantization ────────────────────────────────────────────
+ *
+ * 4-bit quantization: 32 floats → 16 bytes + 1 float16 scale = 18 bytes.
+ * 7x compression. Same format as GGML/llama.cpp Q4_0.
+ *
+ * Block layout: { float16 scale, uint8 qs[16] }
+ * Each uint8 holds two 4-bit values (low nibble + high nibble).
+ * Values are symmetric: -8..7, dequantized as: float = scale * (int4 - 8) */
+
+#define QK4_0 32
+#define QK4_0_BYTES (QK4_0 / 2)  /* 16 bytes of quantized data per block */
+
+typedef struct {
+    __half d;               /* scale (delta) */
+    uint8_t qs[QK4_0_BYTES]; /* quantized 4-bit values, 2 per byte */
+} block_q4_0;
+
+/* Quantize float32 array to Q4_0 blocks */
+__global__ void k_quantize_q4_0(const float *x, block_q4_0 *y, int n) {
+    int block_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = n / QK4_0;
+    if (block_id >= num_blocks) return;
+
+    const float *src = x + block_id * QK4_0;
+    block_q4_0 *dst = y + block_id;
+
+    /* Find absolute max */
+    float amax = 0.0f;
+    for (int i = 0; i < QK4_0; i++) {
+        float a = fabsf(src[i]);
+        if (a > amax) amax = a;
+    }
+
+    float d = amax / 7.0f;  /* scale factor */
+    float id = d ? 1.0f / d : 0.0f;  /* inverse scale */
+    dst->d = __float2half(d);
+
+    /* Quantize: pack two 4-bit values per byte */
+    for (int i = 0; i < QK4_0_BYTES; i++) {
+        int v0 = min(15, (int)(src[i*2 + 0] * id + 8.5f));
+        int v1 = min(15, (int)(src[i*2 + 1] * id + 8.5f));
+        dst->qs[i] = (uint8_t)(v0 | (v1 << 4));
+    }
+}
+
+/* Dequantized matrix-vector multiply: y = Q4_0_matrix @ x_float
+ * A is [rows, cols] in Q4_0 format (cols must be multiple of 32)
+ * x is [cols] float32
+ * y is [rows] float32
+ * One thread block per row. */
+__global__ void k_matvec_q4_0(const block_q4_0 *A, const float *x, float *y,
+                               int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int blocks_per_row = cols / QK4_0;
+    const block_q4_0 *row_blocks = A + row * blocks_per_row;
+
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+
+    /* Each thread handles multiple blocks */
+    for (int b = threadIdx.x; b < blocks_per_row; b += blockDim.x) {
+        float d = __half2float(row_blocks[b].d);
+        const uint8_t *qs = row_blocks[b].qs;
+        const float *xb = x + b * QK4_0;
+
+        /* Unpack and multiply */
+        for (int i = 0; i < QK4_0_BYTES; i++) {
+            int v0 = (qs[i] & 0x0F) - 8;
+            int v1 = (qs[i] >> 4) - 8;
+            sum += d * (float)v0 * xb[i*2 + 0];
+            sum += d * (float)v1 * xb[i*2 + 1];
+        }
+    }
+
+    /* Parallel reduction in shared memory */
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) y[row] = sdata[0];
+}
+
+void gpu_quantize_q4_0(const float *x, void *y, int n) {
+    int num_blocks = n / QK4_0;
+    k_quantize_q4_0<<<(num_blocks + BLOCK - 1) / BLOCK, BLOCK>>>(
+        x, (block_q4_0 *)y, n);
+}
+
+void gpu_matvec_q4_0(const void *A, const float *x, float *y,
+                      int rows, int cols) {
+    int threads = 128;
+    k_matvec_q4_0<<<rows, threads, threads * sizeof(float)>>>(
+        (const block_q4_0 *)A, x, y, rows, cols);
 }
 
 } /* extern "C" */
