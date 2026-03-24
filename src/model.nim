@@ -399,9 +399,8 @@ proc loadModelGguf*(m: var Model, ggufPath: string) =
     uploadF32(&"{p}.attn_norm.weight", m.layers[li].ln1g)
     uploadF32(&"{p}.ffn_norm.weight", m.layers[li].ln2g)
 
-  # Allocate gradient buffers for embeddings + final norm (always trainable)
-  m.dwte = gpuCreate(m.vocabSize * nEmbd)
-  m.dlmHead = gpuCreate(m.vocabSize * nEmbd)
+  # For GGUF fine-tuning: freeze embeddings (too big for gradients)
+  # Only train layer weights + final norm
   m.dlnFg = gpuCreate(nEmbd)
 
   m.quantized = true

@@ -15,21 +15,26 @@ type AdamState = object
 
 proc initAdam(m: Model): AdamState =
   proc addPair(s: var AdamState, buf: GpuBuf) =
-    s.m.add(gpuCreate(buf.numel))
-    s.v.add(gpuCreate(buf.numel))
-  addPair(result, m.wte)
-  addPair(result, m.lmHead)
-  addPair(result, m.lnFg)
-  for layer in m.layers:
-    addPair(result, layer.wq)
-    addPair(result, layer.wk)
-    addPair(result, layer.wv)
-    addPair(result, layer.wo)
-    addPair(result, layer.ln1g)
-    addPair(result, layer.ln2g)
-    addPair(result, layer.fcGate)
-    addPair(result, layer.fcUp)
-    addPair(result, layer.fcDown)
+    if buf.data != nil and buf.numel > 0:
+      s.m.add(gpuCreate(buf.numel))
+      s.v.add(gpuCreate(buf.numel))
+    else:
+      # Frozen — placeholder with zero size
+      s.m.add(GpuBuf(data: nil, numel: 0))
+      s.v.add(GpuBuf(data: nil, numel: 0))
+  addPair(result, m.dwte)    # only if grad exists
+  addPair(result, m.dlmHead)
+  addPair(result, m.dlnFg)
+  for i in 0 ..< m.layers.len:
+    addPair(result, m.layers[i].dwq)
+    addPair(result, m.layers[i].dwk)
+    addPair(result, m.layers[i].dwv)
+    addPair(result, m.layers[i].dwo)
+    addPair(result, m.layers[i].dln1g)
+    addPair(result, m.layers[i].dln2g)
+    addPair(result, m.layers[i].dfcGate)
+    addPair(result, m.layers[i].dfcUp)
+    addPair(result, m.layers[i].dfcDown)
 
 proc adamUpdate(m: var Model, adam: var AdamState, lr: float32,
                 step: int, beta1 = 0.9f, beta2 = 0.999f, wd = 0.1f) =
@@ -37,10 +42,11 @@ proc adamUpdate(m: var Model, adam: var AdamState, lr: float32,
   let bc2 = 1.0f / (1.0f - pow(beta2, float32(step + 1)))
 
   var pairs: seq[(GpuBuf, GpuBuf)] # (param, grad)
-  pairs.add((m.wte, m.dwte))
-  pairs.add((m.lmHead, m.dlmHead))
+  if m.dwte.data != nil: pairs.add((m.wte, m.dwte))
+  if m.dlmHead.data != nil: pairs.add((m.lmHead, m.dlmHead))
   pairs.add((m.lnFg, m.dlnFg))
   for i in 0 ..< m.layers.len:
+    if m.layers[i].dwq.data == nil: continue  # frozen layer
     pairs.add((m.layers[i].wq, m.layers[i].dwq))
     pairs.add((m.layers[i].wk, m.layers[i].dwk))
     pairs.add((m.layers[i].wv, m.layers[i].dwv))
@@ -52,6 +58,7 @@ proc adamUpdate(m: var Model, adam: var AdamState, lr: float32,
     pairs.add((m.layers[i].fcDown, m.layers[i].dfcDown))
 
   for i in 0 ..< pairs.len:
+    if adam.m[i].data == nil: continue  # frozen
     gpu_adamw(pairs[i][0].data, pairs[i][1].data,
               adam.m[i].data, adam.v[i].data,
               lr, beta1, beta2, bc1, bc2, wd,
@@ -187,7 +194,8 @@ when isMainModule:
 
   # Pre-allocate scratch arena — one big GPU alloc instead of ~300 malloc/free per step.
   # Sizes: forward (embed + 8 layers + final norm + logits) + backward (same structure).
-  let S = blockSize  # max sequence length
+  # Use shorter sequences for large models to fit in VRAM
+  let S = if nEmbd >= 2048: 128 else: blockSize
   let n = nEmbd
   let V = tok.vocab.len
   # SwiGLU: 3 FFN buffers in forward (gate, up, swiglu out), 4 in backward (+dGate, +dUp, +dNorm2up)
@@ -195,7 +203,9 @@ when isMainModule:
   let fwdGlobal = S * n + S + 2 * S * V
   let bwdPerLayer = 11 * S * n + 7 * S * headDim + 3 * S * ffnDim + 4 * S * S
   let bwdGlobal = S * V + 2 * S * n
-  let arenaSize = fwdGlobal + fwdPerLayer * nLayer + bwdGlobal + bwdPerLayer * nLayer
+  # Backward only needs space for trainable layers (frozen layers skip backward)
+  let trainableLayers = nLayer - frozenLayers
+  let arenaSize = fwdGlobal + fwdPerLayer * nLayer + bwdGlobal + bwdPerLayer * trainableLayers
   let arenaMB = arenaSize * sizeof(float32) div (1024 * 1024)
   initScratchArena(arenaSize + arenaSize div 4)  # +25% headroom
   echo &"  scratch arena: {arenaMB} MB ({arenaSize} floats)"
@@ -256,13 +266,13 @@ when isMainModule:
     var docIdx = step * batchSize
     for b in 0 ..< batchSize:
       let doc = tokenizedDocs[order[(docIdx + b) mod order.len]]
-      let remaining = blockSize - packed.len
+      let remaining = S - packed.len
       if remaining < 4: break
       let take = min(doc.len, remaining)
       for i in 0 ..< take:
         packed.add(doc[i])
 
-    let seqLen = min(blockSize, packed.len - 1)
+    let seqLen = min(S, packed.len - 1)
     if seqLen < 2: continue
 
     var (cache, loss) = forwardTrain(m, packed[0 ..< seqLen + 1], seqLen)
