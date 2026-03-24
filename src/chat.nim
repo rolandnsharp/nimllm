@@ -8,11 +8,19 @@ import std/[math, random, strformat, os, terminal, strutils, tables]
 
 # ── Sampling ──────────────────────────────────────────────────────
 
-proc sample(logits: seq[float32], temperature: float32 = 0.6f,
-            topK: int = 40): int =
+proc sample(logits: seq[float32], recentTokens: seq[int32],
+            temperature: float32 = 0.6f, topK: int = 40,
+            repetitionPenalty: float32 = 1.2f): int =
   var scaled = newSeq[float32](logits.len)
   for i in 0 ..< logits.len:
     scaled[i] = logits[i] / temperature
+  # Penalize recently generated tokens
+  for tok in recentTokens:
+    if tok >= 0 and tok < scaled.len:
+      if scaled[tok] > 0:
+        scaled[tok] /= repetitionPenalty
+      else:
+        scaled[tok] *= repetitionPenalty
 
   var topIndices = newSeq[int](topK)
   var used = newSeq[bool](logits.len)
@@ -86,7 +94,9 @@ proc generate(m: Model, tok: Tokenizer, prompt: string,
   var response = ""
   for _ in 0 ..< maxTokens:
     if gKv.pos >= blockSize - 1: break  # context full
-    let tokenId = sample(logits)
+    # Pass last 64 tokens for repetition penalty
+    let recent = if history.len > 64: history[history.len - 64 ..< history.len] else: history
+    let tokenId = sample(logits, recent)
 
     if tokenId == tok.bosId or tokenId == tok.userId or
        tokenId == tok.assistantId or
