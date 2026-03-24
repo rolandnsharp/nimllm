@@ -141,8 +141,33 @@ proc trainBpe*(docs: seq[string], numMerges: int = nMerges,
 # ── Encoding ──────────────────────────────────────────────────────
 
 proc encode*(tok: Tokenizer, text: string): seq[int] =
-  ## Encode text to token IDs using learned merges.
-  # Start with byte-level tokenization
+  ## Encode text to token IDs.
+  ## If merges exist: BPE (character-level + merge rules).
+  ## If no merges: greedy longest-match against vocabulary.
+  if tok.merges.len == 0:
+    # Greedy longest-match encoding for pre-trained tokenizers (e.g. SmolLM).
+    # At each position, find the longest vocab entry that matches.
+    var tokens: seq[int]
+    var i = 0
+    while i < text.len:
+      var bestLen = 0
+      var bestId = -1
+      # Try lengths from longest reasonable down to 1
+      for tryLen in countdown(min(text.len - i, 32), 1):
+        let sub = text[i ..< i + tryLen]
+        if sub in tok.tokenToId:
+          bestLen = tryLen
+          bestId = tok.tokenToId[sub]
+          break
+      if bestId >= 0:
+        tokens.add(bestId)
+        i += bestLen
+      else:
+        # Unknown byte — skip
+        i += 1
+    return tokens
+
+  # BPE encoding: start with byte-level tokenization, then apply merges
   var tokens: seq[int]
   var i = 0
   while i < text.len:
@@ -160,17 +185,11 @@ proc encode*(tok: Tokenizer, text: string): seq[int] =
       i += 1
 
   # Fast merge: hash table lookup, merge in-place.
-  # Build pair→merged lookup once (cached globally).
   var pairLookup {.global.}: Table[(int, int), int]
   if pairLookup.len == 0:
     for merge in tok.merges:
       pairLookup[(merge.a, merge.b)] = merge.merged
 
-  # Greedy merge: keep scanning until no merges happen.
-  # Each pass merges the FIRST matching pair it finds (by position).
-  # Pairs are checked against the full merge table (respects priority
-  # implicitly because lower-index merges produce tokens that enable
-  # higher-index merges).
   var changed = true
   while changed:
     changed = false

@@ -12,16 +12,17 @@ import std/[math, random, strformat, os, streams, times]
 # ── Configuration ─────────────────────────────────────────────────
 
 const
-  nLayer   = 12
-  nEmbd    = 768
-  nHead    = 12          # query heads
-  nKvHead  = 4           # key/value heads (GQA: 3:1 ratio)
+  nLayer   = 30
+  nEmbd    = 576
+  nHead    = 9           # query heads
+  nKvHead  = 3           # key/value heads (GQA: 3:1 ratio)
   headDim  = nEmbd div nHead  # 64
   kvRepeat = nHead div nKvHead  # 3
-  nKvDim   = nKvHead * headDim  # 256
+  nKvDim   = nKvHead * headDim  # 192
   blockSize = 512
-  ffnMul   = 4
-  ropeTheta = 500000.0f
+  ffnMul   = 0           # not used — ffnDim set directly
+  ffnDim   = 1536        # SmolLM uses 1536 (not a clean multiple of 576)
+  ropeTheta = 100000.0f
 
 # ── Model ─────────────────────────────────────────────────────────
 
@@ -31,9 +32,9 @@ type
     wk: GpuBuf                    # K projection [nKvDim, nEmbd] (GQA: fewer KV heads)
     wv: GpuBuf                    # V projection [nKvDim, nEmbd]
     wo: GpuBuf                    # output projection [nEmbd, nEmbd]
-    fcGate: GpuBuf                 # SwiGLU gate [ffnMul*nEmbd, nEmbd]
-    fcUp: GpuBuf                   # SwiGLU up [ffnMul*nEmbd, nEmbd]
-    fcDown: GpuBuf                 # SwiGLU down [nEmbd, ffnMul*nEmbd]
+    fcGate: GpuBuf                 # SwiGLU gate [ffnDim, nEmbd]
+    fcUp: GpuBuf                   # SwiGLU up [ffnDim, nEmbd]
+    fcDown: GpuBuf                 # SwiGLU down [nEmbd, ffnDim]
     ln1g, ln2g: GpuBuf            # RMSNorm gamma [nEmbd]
     # Gradients
     dwq, dwk, dwv, dwo: GpuBuf
@@ -89,18 +90,18 @@ proc initModel(vocabSize: int): Model =
       wk: randBuf(nKvDim * nEmbd),      # GQA: K is [nKvDim, nEmbd]
       wv: randBuf(nKvDim * nEmbd),      # GQA: V is [nKvDim, nEmbd]
       wo: randBuf(nEmbd * nEmbd, resStd),
-      fcGate: randBuf(ffnMul * nEmbd * nEmbd),
-      fcUp: randBuf(ffnMul * nEmbd * nEmbd),
-      fcDown: randBuf(nEmbd * ffnMul * nEmbd, resStd),
+      fcGate: randBuf(ffnDim * nEmbd),
+      fcUp: randBuf(ffnDim * nEmbd),
+      fcDown: randBuf(nEmbd * ffnDim, resStd),
       ln1g: onesBuf(nEmbd),
       ln2g: onesBuf(nEmbd),
       dwq: gpuCreate(nEmbd * nEmbd),
       dwk: gpuCreate(nKvDim * nEmbd),
       dwv: gpuCreate(nKvDim * nEmbd),
       dwo: gpuCreate(nEmbd * nEmbd),
-      dfcGate: gpuCreate(ffnMul * nEmbd * nEmbd),
-      dfcUp: gpuCreate(ffnMul * nEmbd * nEmbd),
-      dfcDown: gpuCreate(nEmbd * ffnMul * nEmbd),
+      dfcGate: gpuCreate(ffnDim * nEmbd),
+      dfcUp: gpuCreate(ffnDim * nEmbd),
+      dfcDown: gpuCreate(nEmbd * ffnDim),
       dln1g: gpuCreate(nEmbd),
       dln2g: gpuCreate(nEmbd),
     ))
@@ -123,7 +124,7 @@ proc initModel(vocabSize: int): Model =
 
   # GQA: wq [n,n] + wk [kvd,n] + wv [kvd,n] + wo [n,n] + 3 SwiGLU FFN
   let total = vocabSize * nEmbd * 2 +
-    nLayer * (2 * nEmbd * nEmbd + 2 * nKvDim * nEmbd + 3 * ffnMul * nEmbd * nEmbd)
+    nLayer * (2 * nEmbd * nEmbd + 2 * nKvDim * nEmbd + 3 * ffnDim * nEmbd)
   echo &"  params: {total}"
 
 # ── Saved intermediates for backward ──────────────────────────────
@@ -235,17 +236,17 @@ proc forward(m: Model, tokens: seq[int32], seqLen: int): (ForwardCache, float32)
     gpu_rmsnorm_affine_fwd(x.data, layer.ln2g.data, lc.xNorm2.data, lc.rms2.data, cint(S), cint(n))
 
     # MLP: SwiGLU — gate and up projections, then swish(gate) * up, then down
-    lc.fc1Out = trackedCreate(S * ffnMul * n)  # gate projection
-    gpuSgemm(2, S, ffnMul * n, n, lc.xNorm2, layer.fcGate, lc.fc1Out)
+    lc.fc1Out = trackedCreate(S * ffnDim)  # gate projection
+    gpuSgemm(2, S, ffnDim, n, lc.xNorm2, layer.fcGate, lc.fc1Out)
 
-    lc.upOut = trackedCreate(S * ffnMul * n)    # up projection
-    gpuSgemm(2, S, ffnMul * n, n, lc.xNorm2, layer.fcUp, lc.upOut)
+    lc.upOut = trackedCreate(S * ffnDim)    # up projection
+    gpuSgemm(2, S, ffnDim, n, lc.xNorm2, layer.fcUp, lc.upOut)
 
-    lc.geluOut = trackedCreate(S * ffnMul * n)  # swish(gate) * up
-    gpu_swiglu_fwd(lc.fc1Out.data, lc.upOut.data, lc.geluOut.data, cint(S * ffnMul * n))
+    lc.geluOut = trackedCreate(S * ffnDim)  # swish(gate) * up
+    gpu_swiglu_fwd(lc.fc1Out.data, lc.upOut.data, lc.geluOut.data, cint(S * ffnDim))
 
     var mlpOut = trackedCreate(S * n)
-    gpuSgemm(2, S, n, ffnMul * n, lc.geluOut, layer.fcDown, mlpOut)
+    gpuSgemm(2, S, n, ffnDim, lc.geluOut, layer.fcDown, mlpOut)
 
     # Residual 2: x = x2 + mlpOut
     let xNew = trackedCreate(S * n)
@@ -319,24 +320,24 @@ proc backward(m: var Model, tokens: seq[int32], seqLen: int,
 
     # MLP backward: SwiGLU
     # down projection backward
-    let dSwigluOut = trackedCreate(S * ffnMul * n)
-    gpuSgemm(1, S, ffnMul * n, n, dMlpOut, layer.fcDown, dSwigluOut)
-    gpuSgemm(5, n, ffnMul * n, S, dMlpOut, lc.geluOut, m.layers[li].dfcDown)
+    let dSwigluOut = trackedCreate(S * ffnDim)
+    gpuSgemm(1, S, ffnDim, n, dMlpOut, layer.fcDown, dSwigluOut)
+    gpuSgemm(5, n, ffnDim, S, dMlpOut, lc.geluOut, m.layers[li].dfcDown)
 
     # SwiGLU backward: dGate and dUp from dSwigluOut
-    let dGate = trackedCreate(S * ffnMul * n)
-    let dUp = trackedCreate(S * ffnMul * n)
+    let dGate = trackedCreate(S * ffnDim)
+    let dUp = trackedCreate(S * ffnDim)
     gpu_swiglu_bwd(lc.fc1Out.data, lc.upOut.data, dSwigluOut.data,
-                   dGate.data, dUp.data, cint(S * ffnMul * n))
+                   dGate.data, dUp.data, cint(S * ffnDim))
 
     # Gate and up projection backward
     let dNorm2 = trackedCreate(S * n)
-    gpuSgemm(1, S, n, ffnMul * n, dGate, layer.fcGate, dNorm2)
-    gpuSgemm(5, ffnMul * n, n, S, dGate, lc.xNorm2, m.layers[li].dfcGate)
+    gpuSgemm(1, S, n, ffnDim, dGate, layer.fcGate, dNorm2)
+    gpuSgemm(5, ffnDim, n, S, dGate, lc.xNorm2, m.layers[li].dfcGate)
 
     let dNorm2up = trackedCreate(S * n)
-    gpuSgemm(1, S, n, ffnMul * n, dUp, layer.fcUp, dNorm2up)
-    gpuSgemm(5, ffnMul * n, n, S, dUp, lc.xNorm2, m.layers[li].dfcUp)
+    gpuSgemm(1, S, n, ffnDim, dUp, layer.fcUp, dNorm2up)
+    gpuSgemm(5, ffnDim, n, S, dUp, lc.xNorm2, m.layers[li].dfcUp)
     gpu_add_inplace(dNorm2.data, dNorm2up.data, cint(S * n))
 
     # RMSNorm 2 backward
@@ -618,9 +619,9 @@ proc growModel(m: var Model, oldFile: string) =
     readGrowMatrix(m.layers[li].wk, oldEmbd, oldEmbd, nEmbd)
     readGrowMatrix(m.layers[li].wv, oldEmbd, oldEmbd, nEmbd)
     readGrowMatrix(m.layers[li].wo, oldEmbd, oldEmbd, nEmbd)
-    readGrowMatrix(m.layers[li].fcGate, ffnMul * oldEmbd, oldEmbd, nEmbd)
-    readGrowMatrix(m.layers[li].fcUp, ffnMul * oldEmbd, oldEmbd, nEmbd)
-    readGrowMatrix(m.layers[li].fcDown, oldEmbd, ffnMul * oldEmbd, ffnMul * nEmbd)
+    readGrowMatrix(m.layers[li].fcGate, ffnDim, oldEmbd, nEmbd)
+    readGrowMatrix(m.layers[li].fcUp, ffnDim, oldEmbd, nEmbd)
+    readGrowMatrix(m.layers[li].fcDown, oldEmbd, ffnDim, ffnDim)
     readGrowVec(m.layers[li].ln1g, oldEmbd)
     readGrowVec(m.layers[li].ln2g, oldEmbd)
     li += 1
@@ -798,9 +799,9 @@ when isMainModule:
   let n = nEmbd
   let V = tok.vocab.len
   # SwiGLU: 3 FFN buffers in forward (gate, up, swiglu out), 4 in backward (+dGate, +dUp, +dNorm2up)
-  let fwdPerLayer = 10 * S * n + 4 * S * headDim + 2 * S + 3 * S * ffnMul * n + 2 * S * S
+  let fwdPerLayer = 10 * S * n + 4 * S * headDim + 2 * S + 3 * S * ffnDim + 2 * S * S
   let fwdGlobal = S * n + S + 2 * S * V
-  let bwdPerLayer = 11 * S * n + 7 * S * headDim + 3 * S * ffnMul * n + 4 * S * S
+  let bwdPerLayer = 11 * S * n + 7 * S * headDim + 3 * S * ffnDim + 4 * S * S
   let bwdGlobal = S * V + 2 * S * n
   let arenaSize = fwdGlobal + fwdPerLayer * nLayer + bwdGlobal + bwdPerLayer * nLayer
   let arenaMB = arenaSize * sizeof(float32) div (1024 * 1024)
@@ -849,13 +850,25 @@ when isMainModule:
   var optStep = 0
   let logInterval = 50  # in optimizer steps
 
+  let batchSize = 8  # pack this many docs into one forward pass
+
   for step in 0 ..< numSteps:
-    let tokens = tokenizedDocs[order[step mod order.len]]
-    let seqLen = min(blockSize, tokens.len - 1)
+    # Pack multiple docs into one long sequence (up to blockSize tokens)
+    var packed: seq[int32]
+    var docIdx = step * batchSize
+    for b in 0 ..< batchSize:
+      let doc = tokenizedDocs[order[(docIdx + b) mod order.len]]
+      let remaining = blockSize - packed.len
+      if remaining < 4: break
+      let take = min(doc.len, remaining)
+      for i in 0 ..< take:
+        packed.add(doc[i])
+
+    let seqLen = min(blockSize, packed.len - 1)
     if seqLen < 2: continue
 
-    var (cache, loss) = forward(m, tokens[0 ..< seqLen + 1], seqLen)
-    backward(m, tokens[0 ..< seqLen + 1], seqLen, cache)
+    var (cache, loss) = forward(m, packed[0 ..< seqLen + 1], seqLen)
+    backward(m, packed[0 ..< seqLen + 1], seqLen, cache)
     freeStepAllocations()
 
     lossSum += loss

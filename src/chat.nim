@@ -4,20 +4,20 @@
 ## Inspired by Girvent's clean Nim TUI.
 
 import gpu, bpe, autograd
-import std/[math, random, strformat, os, streams, terminal, strutils]
+import std/[math, random, strformat, os, streams, terminal, strutils, tables]
 
 # Must match microgpt.nim constants exactly
 const
-  nLayer   = 12
-  nEmbd    = 768
-  nHead    = 12
-  nKvHead  = 4
+  nLayer   = 30
+  nEmbd    = 576
+  nHead    = 9
+  nKvHead  = 3
   headDim  = nEmbd div nHead  # 64
   kvRepeat = nHead div nKvHead  # 3
-  nKvDim   = nKvHead * headDim  # 256
+  nKvDim   = nKvHead * headDim  # 192
   blockSize = 512
-  ffnMul   = 4
-  ropeTheta = 500000.0f
+  ffnDim   = 1536
+  ropeTheta = 100000.0f
 
 # Import the model type and forward from microgpt
 # For now, duplicate the minimal types needed
@@ -78,17 +78,17 @@ proc initModel(vocabSize: int): Model =
       wk: randBuf(nKvDim * nEmbd),
       wv: randBuf(nKvDim * nEmbd),
       wo: randBuf(nEmbd * nEmbd, resStd),
-      fcGate: randBuf(ffnMul * nEmbd * nEmbd),
-      fcUp: randBuf(ffnMul * nEmbd * nEmbd),
-      fcDown: randBuf(nEmbd * ffnMul * nEmbd, resStd),
+      fcGate: randBuf(ffnDim * nEmbd),
+      fcUp: randBuf(ffnDim * nEmbd),
+      fcDown: randBuf(nEmbd * ffnDim, resStd),
       ln1g: onesBuf(nEmbd), ln2g: onesBuf(nEmbd),
       dwq: gpuCreate(nEmbd * nEmbd),
       dwk: gpuCreate(nKvDim * nEmbd),
       dwv: gpuCreate(nKvDim * nEmbd),
       dwo: gpuCreate(nEmbd * nEmbd),
-      dfcGate: gpuCreate(ffnMul * nEmbd * nEmbd),
-      dfcUp: gpuCreate(ffnMul * nEmbd * nEmbd),
-      dfcDown: gpuCreate(nEmbd * ffnMul * nEmbd),
+      dfcGate: gpuCreate(ffnDim * nEmbd),
+      dfcUp: gpuCreate(ffnDim * nEmbd),
+      dfcDown: gpuCreate(nEmbd * ffnDim),
       dln1g: gpuCreate(nEmbd), dln2g: gpuCreate(nEmbd),
     ))
 
@@ -186,14 +186,14 @@ proc forwardOneToken(m: Model, tokenIds: seq[int32], seqLen: int): seq[float32] 
     gpu_rmsnorm_affine_fwd(x2.data, layer.ln2g.data, xNorm2.data, rms2.data, cint(S), cint(n))
 
     # SwiGLU FFN
-    let gateOut = trackedCreate(S * ffnMul * n)
-    gpuSgemm(2, S, ffnMul * n, n, xNorm2, layer.fcGate, gateOut)
-    let upOut = trackedCreate(S * ffnMul * n)
-    gpuSgemm(2, S, ffnMul * n, n, xNorm2, layer.fcUp, upOut)
-    let swigluOut = trackedCreate(S * ffnMul * n)
-    gpu_swiglu_fwd(gateOut.data, upOut.data, swigluOut.data, cint(S * ffnMul * n))
+    let gateOut = trackedCreate(S * ffnDim)
+    gpuSgemm(2, S, ffnDim, n, xNorm2, layer.fcGate, gateOut)
+    let upOut = trackedCreate(S * ffnDim)
+    gpuSgemm(2, S, ffnDim, n, xNorm2, layer.fcUp, upOut)
+    let swigluOut = trackedCreate(S * ffnDim)
+    gpu_swiglu_fwd(gateOut.data, upOut.data, swigluOut.data, cint(S * ffnDim))
     let mlpOut = trackedCreate(S * n)
-    gpuSgemm(2, S, n, ffnMul * n, swigluOut, layer.fcDown, mlpOut)
+    gpuSgemm(2, S, n, ffnDim, swigluOut, layer.fcDown, mlpOut)
 
     let xNew = trackedCreate(S * n)
     gpu_add(x2.data, mlpOut.data, xNew.data, cint(S * n))
@@ -213,7 +213,7 @@ proc forwardOneToken(m: Model, tokenIds: seq[int32], seqLen: int): seq[float32] 
 
 # ── Sampling ──────────────────────────────────────────────────────
 
-proc sample(logits: seq[float32], temperature: float32 = 0.8f,
+proc sample(logits: seq[float32], temperature: float32 = 0.6f,
             topK: int = 40): int =
   ## Sample a token from logits with temperature and top-k.
   var scaled = newSeq[float32](logits.len)
@@ -261,9 +261,23 @@ proc sample(logits: seq[float32], temperature: float32 = 0.8f,
 proc generate(m: Model, tok: Tokenizer, prompt: string,
               history: var seq[int32], maxTokens: int = 200): string =
   ## Generate a response to a prompt. Returns the generated text.
-  let inputTokens = tok.encode("<|user|> " & prompt & " <|assistant|> ")
+  # Format prompt with ChatML tokens if available, otherwise use our tokens
+  let hasImTokens = tok.tokenToId.getOrDefault("<|im_start|>", -1) >= 0
+  let imStart = if hasImTokens: "<|im_start|>" else: ""
+  let imEnd = if hasImTokens: "<|im_end|>" else: ""
+  let chatPrompt = if imStart.len > 0:
+      (if history.len == 0: imStart & "system\nYou are a helpful assistant." & imEnd & "\n" else: "") &
+      imStart & "user\n" & prompt & imEnd & "\n" & imStart & "assistant\n"
+    else:
+      "<|user|> " & prompt & " <|assistant|> "
+  let inputTokens = tok.encode(chatPrompt)
   for id in inputTokens:
     history.add(int32(id))
+
+  # Stop tokens: EOS, im_start, im_end, or our special tokens
+  let eosId = tok.tokenToId.getOrDefault("<|endoftext|>", -1)
+  let imStartId = tok.tokenToId.getOrDefault("<|im_start|>", -1)
+  let imEndId = tok.tokenToId.getOrDefault("<|im_end|>", -1)
 
   var response = ""
   for _ in 0 ..< maxTokens:
@@ -275,16 +289,19 @@ proc generate(m: Model, tok: Tokenizer, prompt: string,
     freeStepAllocations()
     let tokenId = sample(logits)
 
-    # Stop on special tokens (with fixed tokenizer, these are always atomic)
+    # Stop on any end-of-turn token
     if tokenId == tok.bosId or tokenId == tok.userId or
-       tokenId == tok.assistantId:
+       tokenId == tok.assistantId or
+       tokenId == eosId or tokenId == imStartId or tokenId == imEndId:
       break
 
     history.add(int32(tokenId))
     let tokenStr = tok.vocab[tokenId]
-    response.add(tokenStr)
+    # Don't display ChatML formatting tokens
+    if "<|im_start|>" notin tokenStr and "<|im_end|>" notin tokenStr:
+      response.add(tokenStr)
 
-  response
+  response.strip()
 
 when isMainModule:
   let baseDir = getAppDir().parentDir()
@@ -321,7 +338,7 @@ when isMainModule:
   # Interactive mode
   echo ""
   let pc = tok.vocab.len * nEmbd * 2 + blockSize * nEmbd +
-    nLayer * (4 * nEmbd * nEmbd + 2 * ffnMul * nEmbd * nEmbd)
+    nLayer * (4 * nEmbd * nEmbd + 2 * ffnDim * nEmbd)
   styledEcho(styleBright, "  nimllm", resetStyle,
              fgBlack, "  ·  ", resetStyle,
              $(pc div 1000000), "M params")
