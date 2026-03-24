@@ -324,6 +324,8 @@ proc gpu_quantize_q4_0*(x: pointer, y: pointer, n: cint)
   {.importc, cdecl.}
 proc gpu_matvec_q4_0*(A: pointer, x: pointer, y: pointer, rows, cols: cint)
   {.importc, cdecl.}
+proc gpu_matvec_q8_0*(A: pointer, x: pointer, y: pointer, rows, cols: cint)
+  {.importc, cdecl.}
 
 # ── High-level wrappers using GpuBuf ─────────────────────────────
 

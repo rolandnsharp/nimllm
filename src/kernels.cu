@@ -1006,4 +1006,64 @@ void gpu_matvec_q4_0(const void *A, const float *x, float *y,
         (const block_q4_0 *)A, x, y, rows, cols);
 }
 
+/* ── Q8_0 Dequantized matrix-vector multiply ──────────────────────
+ *
+ * Q8_0: 32 int8 values + 1 float16 scale = 34 bytes per block.
+ * Simpler than Q4_0, better accuracy. */
+
+typedef struct {
+    __half d;              /* scale */
+    int8_t qs[32];         /* quantized values */
+} block_q8_0;
+
+__global__ void k_matvec_q8_0(const block_q8_0 *A, const float *x, float *y,
+                               int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int blocks_per_row = cols / 32;
+    const block_q8_0 *row_blocks = A + row * blocks_per_row;
+
+    extern __shared__ float sx[];
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        sx[i] = x[i];
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int b = threadIdx.x; b < blocks_per_row; b += blockDim.x) {
+        float d = __half2float(row_blocks[b].d);
+        const int8_t *qs = row_blocks[b].qs;
+        int base = b * 32;
+        float local_sum = 0.0f;
+        for (int i = 0; i < 32; i++)
+            local_sum += (float)qs[i] * sx[base + i];
+        sum += d * local_sum;
+    }
+
+    /* Warp reduction */
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) sx[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int num_warps = blockDim.x / 32;
+        sum = (lane_id < num_warps) ? sx[lane_id] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane_id == 0) y[row] = sum;
+    }
+}
+
+void gpu_matvec_q8_0(const void *A, const float *x, float *y,
+                      int rows, int cols) {
+    int threads = 256;
+    int smem = cols * sizeof(float);
+    k_matvec_q8_0<<<rows, threads, smem>>>(
+        (const block_q8_0 *)A, x, y, rows, cols);
+}
+
 } /* extern "C" */
