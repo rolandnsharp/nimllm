@@ -1024,17 +1024,31 @@ __global__ void k_matvec_q8_0(const block_q8_0 *A, const float *x, float *y,
     int blocks_per_row = cols / 32;
     const block_q8_0 *row_blocks = A + row * blocks_per_row;
 
-    /* Simple single-thread per row — correct first, optimize later */
-    if (threadIdx.x == 0) {
-        float sum = 0.0f;
-        for (int b = 0; b < blocks_per_row; b++) {
-            float d = __half2float(row_blocks[b].d);
-            const int8_t *qs = row_blocks[b].qs;
-            for (int i = 0; i < 32; i++)
-                sum += d * (float)qs[i] * x[b * 32 + i];
-        }
-        y[row] = sum;
+    extern __shared__ float sx[];
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        sx[i] = x[i];
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int b = threadIdx.x; b < blocks_per_row; b += blockDim.x) {
+        float d = __half2float(row_blocks[b].d);
+        const int8_t *qs = row_blocks[b].qs;
+        int base = b * 32;
+        float local_sum = 0.0f;
+        for (int i = 0; i < 32; i++)
+            local_sum += (float)qs[i] * sx[base + i];
+        sum += d * local_sum;
     }
+
+    __syncthreads();
+    sx[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s)
+            sx[threadIdx.x] += sx[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[row] = sx[0];
 }
 
 void gpu_matvec_q8_0(const void *A, const float *x, float *y,

@@ -168,10 +168,15 @@ when isMainModule:
   initScratchArena(infArena)
   echo &"  inference arena: {infArena * 4 div 1024 div 1024}MB"
 
-  # Non-interactive mode
-  if paramCount() >= 2 and paramStr(1) == "--prompt":
-    var prompt = paramStr(2)
-    for i in 3 .. paramCount(): prompt &= " " & paramStr(i)
+  # Non-interactive mode — find --prompt anywhere in args
+  var promptIdx = -1
+  for i in 1 .. paramCount():
+    if paramStr(i) == "--prompt": promptIdx = i
+  if promptIdx > 0 and promptIdx < paramCount():
+    var prompt = paramStr(promptIdx + 1)
+    for i in promptIdx + 2 .. paramCount():
+      if paramStr(i) != "--gguf" and (i < 2 or paramStr(i-1) != "--gguf"):
+        prompt &= " " & paramStr(i)
     var history: seq[int32]
     echo generate(m, tok, prompt, history)
     quit(0)

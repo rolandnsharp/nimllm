@@ -230,10 +230,35 @@ proc loadModelGguf*(m: var Model, ggufPath: string) =
   echo "loading GGUF from ", ggufPath, "..."
   let gf = openGguf(ggufPath)
 
-  proc uploadQ8(name: string): pointer =
-    ## Load Q8_0 tensor raw bytes to GPU
-    let raw = gf.loadTensorRaw(name)
+  proc uploadQ8(name: string, unpermute: bool = false, heads: int = 0): pointer =
+    ## Load Q8_0 tensor raw bytes to GPU.
+    ## If unpermute=true, reverse ggml's head interleaving for Q/K weights.
+    var raw = gf.loadTensorRaw(name)
     if raw.len == 0: return nil
+
+    if unpermute and heads > 0:
+      # Reverse ggml permutation: [head, 2, headDim/2, ...] -> [head, headDim/2, 2, ...]
+      # Each row is headDim values. The permutation interleaves first/second half.
+      # In Q8_0: each block is 34 bytes for 32 values.
+      # We need to permute at the ROW level, not within blocks.
+      let t = gf.tensors[name]
+      let cols = t.dims[0].int  # ne0
+      let rows = t.dims[1].int  # ne1
+      let bytesPerRow = (cols div 32) * 34
+      let hd = rows div heads  # headDim per head in the output dimension
+      var permuted = newSeq[uint8](raw.len)
+      for h in 0 ..< heads:
+        for i in 0 ..< hd div 2:
+          # Source interleaved: [h*hd + 2*i] and [h*hd + 2*i + 1]
+          # Dest split: [h*hd + i] and [h*hd + hd/2 + i]
+          let srcRow0 = h * hd + 2 * i
+          let srcRow1 = h * hd + 2 * i + 1
+          let dstRow0 = h * hd + i
+          let dstRow1 = h * hd + hd div 2 + i
+          copyMem(addr permuted[dstRow0 * bytesPerRow], addr raw[srcRow0 * bytesPerRow], bytesPerRow)
+          copyMem(addr permuted[dstRow1 * bytesPerRow], addr raw[srcRow1 * bytesPerRow], bytesPerRow)
+      raw = permuted
+
     var p: pointer
     let err = cudaMalloc(addr p, csize_t(raw.len))
     assert err == CudaSuccess, "cudaMalloc failed for " & name
@@ -301,8 +326,9 @@ proc loadModelGguf*(m: var Model, ggufPath: string) =
   for li in 0 ..< nLayer:
     echo &"  layer {li+1}/{nLayer}"
     let p = &"blk.{li}"
-    m.layers[li].wq_q4 = uploadQ8(&"{p}.attn_q.weight")
-    m.layers[li].wk_q4 = uploadQ8(&"{p}.attn_k.weight")
+    # Q and K weights are permuted for ggml's RoPE — unpermute for our RoPE
+    m.layers[li].wq_q4 = uploadQ8(&"{p}.attn_q.weight", unpermute=true, heads=nHead)
+    m.layers[li].wk_q4 = uploadQ8(&"{p}.attn_k.weight", unpermute=true, heads=nKvHead)
     m.layers[li].wv_q4 = uploadQ8(&"{p}.attn_v.weight")
     m.layers[li].wo_q4 = uploadQ8(&"{p}.attn_output.weight")
     m.layers[li].fcGate_q4 = uploadQ8(&"{p}.ffn_gate.weight")
@@ -765,7 +791,7 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
                          cint(newTokens), cint(n))
 
   let logits = trackedCreate(newTokens * m.vocabSize)
-  if m.quantized and newTokens == 1:
+  if m.quantized and newTokens == 1 and m.lmHead_q4 != nil:
     quantMatvec(m.lmHead_q4, finalNormed.data, logits.data, cint(m.vocabSize), cint(n))
   else:
     gpuSgemm(2, newTokens, m.vocabSize, n, finalNormed, m.lmHead, logits)
