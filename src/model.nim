@@ -32,15 +32,21 @@ type
     dwq*, dwk*, dwv*, dwo*: GpuBuf
     dfcGate*, dfcUp*, dfcDown*: GpuBuf
     dln1g*, dln2g*: GpuBuf
+    # Q4_0 quantized weights (inference only — 7x smaller)
+    wq_q4*, wk_q4*, wv_q4*, wo_q4*: pointer
+    fcGate_q4*, fcUp_q4*, fcDown_q4*: pointer
 
   Model* = object
     wte*, lmHead*, lnFg*: GpuBuf
     layers*: seq[Layer]
     vocabSize*: int
+    quantized*: bool        # true if Q4_0 weights are available
     dwte*, dlmHead*, dlnFg*: GpuBuf
     tokIdBuf*: pointer
     targetIdBuf*: pointer
     ropeCos*, ropeSin*: GpuBuf
+    # Q4_0 quantized (inference only)
+    lmHead_q4*: pointer
 
   LayerCache* = object
     x1*: GpuBuf
@@ -198,6 +204,37 @@ proc loadModel*(m: var Model, filename: string) =
     r(m.layers[i].fcGate); r(m.layers[i].fcUp); r(m.layers[i].fcDown)
     r(m.layers[i].ln1g); r(m.layers[i].ln2g)
   echo "  done"
+
+# ── Q4_0 Quantization for fast inference ─────────────────────────
+
+proc quantizeQ4(buf: GpuBuf): pointer =
+  ## Quantize a float32 GPU buffer to Q4_0. Returns pointer to Q4_0 data.
+  ## Q4_0: 18 bytes per 32 floats (block_q4_0 = {half d, uint8 qs[16]}).
+  let numBlocks = buf.numel div 32
+  let q4Size = numBlocks * 18  # 18 bytes per block
+  var q4ptr: pointer
+  let err = cudaMalloc(addr q4ptr, csize_t(q4Size))
+  assert err == CudaSuccess, "Q4_0 cudaMalloc failed"
+  gpu_quantize_q4_0(buf.data, q4ptr, cint(buf.numel))
+  q4ptr
+
+proc quantizeModel*(m: var Model) =
+  ## Quantize all weight matrices to Q4_0 for fast inference.
+  ## Keeps float32 weights for training. Q4_0 used only in forwardCached.
+  echo "quantizing to Q4_0..."
+  m.lmHead_q4 = quantizeQ4(m.lmHead)
+  for i in 0 ..< m.layers.len:
+    m.layers[i].wq_q4 = quantizeQ4(m.layers[i].wq)
+    m.layers[i].wk_q4 = quantizeQ4(m.layers[i].wk)
+    m.layers[i].wv_q4 = quantizeQ4(m.layers[i].wv)
+    m.layers[i].wo_q4 = quantizeQ4(m.layers[i].wo)
+    m.layers[i].fcGate_q4 = quantizeQ4(m.layers[i].fcGate)
+    m.layers[i].fcUp_q4 = quantizeQ4(m.layers[i].fcUp)
+    m.layers[i].fcDown_q4 = quantizeQ4(m.layers[i].fcDown)
+  m.quantized = true
+  let origMB = (m.vocabSize * nEmbd * 2 + nLayer * (2*nEmbd*nEmbd + 2*nKvDim*nEmbd + 3*ffnDim*nEmbd)) * 4 div (1024*1024)
+  let q4MB = (m.vocabSize * nEmbd + nLayer * (nEmbd*nEmbd + nKvDim*nEmbd + nKvDim*nEmbd + nEmbd*nEmbd + ffnDim*nEmbd + ffnDim*nEmbd + nEmbd*ffnDim)) * 18 div 32 div (1024*1024)
+  echo &"  done ({origMB}MB float32 → ~{q4MB}MB Q4_0)"
 
 # ── Forward pass ──────────────────────────────────────────────────
 
@@ -494,9 +531,15 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
     let q = trackedCreate(newTokens * n)
     let kNew = trackedCreate(newTokens * nKvDim)
     let vNew = trackedCreate(newTokens * nKvDim)
-    gpuSgemm(2, newTokens, n, n, xNorm, layer.wq, q)
-    gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wk, kNew)
-    gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wv, vNew)
+    if m.quantized and newTokens == 1:
+      # Q4_0 matvec: 7x less memory bandwidth
+      gpu_matvec_q4_0(layer.wq_q4, xNorm.data, q.data, cint(n), cint(n))
+      gpu_matvec_q4_0(layer.wk_q4, xNorm.data, kNew.data, cint(nKvDim), cint(n))
+      gpu_matvec_q4_0(layer.wv_q4, xNorm.data, vNew.data, cint(nKvDim), cint(n))
+    else:
+      gpuSgemm(2, newTokens, n, n, xNorm, layer.wq, q)
+      gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wk, kNew)
+      gpuSgemm(2, newTokens, nKvDim, n, xNorm, layer.wv, vNew)
 
     # RoPE — use model's pre-computed tables with position offset
     # The tables are [blockSize, halfDim]. We need rows starting at kv.pos.
@@ -560,7 +603,10 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
 
     # Output projection + residual
     let projected = trackedCreate(newTokens * n)
-    gpuSgemm(2, newTokens, n, n, attnOut, layer.wo, projected)
+    if m.quantized and newTokens == 1:
+      gpu_matvec_q4_0(layer.wo_q4, attnOut.data, projected.data, cint(n), cint(n))
+    else:
+      gpuSgemm(2, newTokens, n, n, attnOut, layer.wo, projected)
     let x2 = trackedCreate(newTokens * n)
     gpu_add(x.data, projected.data, x2.data, cint(newTokens * n))
 
@@ -571,13 +617,20 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
                            cint(newTokens), cint(n))
 
     let gateOut = trackedCreate(newTokens * ffnDim)
-    gpuSgemm(2, newTokens, ffnDim, n, xNorm2, layer.fcGate, gateOut)
     let upOut = trackedCreate(newTokens * ffnDim)
-    gpuSgemm(2, newTokens, ffnDim, n, xNorm2, layer.fcUp, upOut)
+    if m.quantized and newTokens == 1:
+      gpu_matvec_q4_0(layer.fcGate_q4, xNorm2.data, gateOut.data, cint(ffnDim), cint(n))
+      gpu_matvec_q4_0(layer.fcUp_q4, xNorm2.data, upOut.data, cint(ffnDim), cint(n))
+    else:
+      gpuSgemm(2, newTokens, ffnDim, n, xNorm2, layer.fcGate, gateOut)
+      gpuSgemm(2, newTokens, ffnDim, n, xNorm2, layer.fcUp, upOut)
     let swigluOut = trackedCreate(newTokens * ffnDim)
     gpu_swiglu_fwd(gateOut.data, upOut.data, swigluOut.data, cint(newTokens * ffnDim))
     let mlpOut = trackedCreate(newTokens * n)
-    gpuSgemm(2, newTokens, n, ffnDim, swigluOut, layer.fcDown, mlpOut)
+    if m.quantized and newTokens == 1:
+      gpu_matvec_q4_0(layer.fcDown_q4, swigluOut.data, mlpOut.data, cint(n), cint(ffnDim))
+    else:
+      gpuSgemm(2, newTokens, n, ffnDim, swigluOut, layer.fcDown, mlpOut)
 
     let xNew = trackedCreate(newTokens * n)
     gpu_add(x2.data, mlpOut.data, xNew.data, cint(newTokens * n))
@@ -590,7 +643,10 @@ proc forwardCached*(m: Model, kv: var KvCache, tokens: seq[int32]): seq[float32]
                          cint(newTokens), cint(n))
 
   let logits = trackedCreate(newTokens * m.vocabSize)
-  gpuSgemm(2, newTokens, m.vocabSize, n, finalNormed, m.lmHead, logits)
+  if m.quantized and newTokens == 1:
+    gpu_matvec_q4_0(m.lmHead_q4, finalNormed.data, logits.data, cint(m.vocabSize), cint(n))
+  else:
+    gpuSgemm(2, newTokens, m.vocabSize, n, finalNormed, m.lmHead, logits)
 
   # Update cache position
   kv.pos += newTokens

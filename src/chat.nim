@@ -138,6 +138,9 @@ when isMainModule:
     echo "no model found at ", modelFile
     quit(1)
 
+  # Quantize weights to Q4_0 for fast inference
+  quantizeModel(m)
+
   randomize()
   trackingEnabled = true
 
