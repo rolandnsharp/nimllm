@@ -724,11 +724,15 @@ when isMainModule:
   let checkpointFile = vidyaRoot / "nimllm.bin"
 
   # Check modes: --read <file>, --grow <old_checkpoint>
-  let readMode = paramCount() >= 1 and paramStr(1) == "--read"
-  let readFile = if readMode and paramCount() >= 2: paramStr(2) else: ""
   let growMode = paramCount() >= 1 and paramStr(1) == "--grow"
   let growFile = if growMode and paramCount() >= 2: paramStr(2) else: ""
-  let continueMode = paramCount() >= 1 and paramStr(1) == "--continue"
+  # Any non-flag argument is a file to train on
+  let trainFile = if paramCount() >= 1 and paramStr(1)[0] != '-': paramStr(1)
+                  elif paramCount() >= 2 and paramStr(1) == "--read": paramStr(2)  # backward compat
+                  else: ""
+  let readMode = trainFile.len > 0  # training on a specific file
+  let readFile = trainFile
+  let continueMode = not readMode  # always continue when training on full dataset
 
   echo "init model..."
   var m = initModel(tok.vocab.len)
